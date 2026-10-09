@@ -12,10 +12,21 @@
  * automatically hands off to its sibling. So you can always just run
  * SadieDate.exe.
  *
- * Usage:
- *   Configure SadieDate.ini and double-click, or:
+ * CONFIGURATION (SadieDate.ini, in the same folder)
+ *   Single program:
+ *       [SadieDate]
+ *       TargetDate=2008-01-01
+ *       Program=C:\Program Files\SADiE\SADiE.exe
+ *   Several versions (different folders / names / expiry dates):
+ *       [Programs]
+ *       1=SADiE 5 | C:\Program Files\SADiE 5\Sadie5.exe | 2008-01-01
+ *       2=SADiE 6 | D:\Audio\SADiE 6\Sadie6.exe         | 2010-06-01
+ *   With more than one program listed, SadieDate shows a menu. You can also
+ *   pick one directly:   SadieDate.exe 2        (by number)
+ *                        SadieDate.exe "SADiE 6" (by label)
+ *
+ * Command line (overrides the INI):
  *     SadieDate.exe "YYYY-MM-DD" "C:\Path\To\SADiE.exe" [extra args...]
- *     SadieDate.exe "YYYY-MM-DD HH:MM:SS" "C:\Path\To\SADiE.exe"
  */
 
 #ifndef UNICODE
@@ -44,11 +55,30 @@
 #  define SIBLING_W    L"SadieDate64.exe"    /* the 64-bit build */
 #endif
 
+#define MAX_PROGRAMS 64
+
+typedef struct {
+    wchar_t label[80];
+    wchar_t path[MAX_PATH];
+    wchar_t date[64];           /* empty = use the global TargetDate */
+} Program;
+
 static void press_enter_to_exit(void)
 {
     fputws(L"\nPress Enter to close...", stdout);
     fflush(stdout);
     (void)getwchar();
+}
+
+/* Trim leading/trailing spaces and tabs in place. */
+static void trimw(wchar_t *s)
+{
+    wchar_t *p = s, *e;
+    while (*p == L' ' || *p == L'\t') p++;
+    if (p != s) memmove(s, p, (wcslen(p) + 1) * sizeof(wchar_t));
+    e = s + wcslen(s);
+    while (e > s && (e[-1] == L' ' || e[-1] == L'\t' ||
+                     e[-1] == L'\r' || e[-1] == L'\n')) *--e = L'\0';
 }
 
 /* Parse "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS" (also accepts / or .). */
@@ -103,14 +133,121 @@ static WORD read_machine(const wchar_t *path)
     return machine;
 }
 
-/* Hand off to the other-bitness sibling, passing our original arguments. */
-static int dispatch_to_sibling(const wchar_t *selfDir)
+/* Read the [Programs] list from the INI. Returns the count found. */
+static int gather_programs(const wchar_t *iniPath, Program *out, int maxN)
+{
+    int i, n = 0;
+    for (i = 1; i <= 99 && n < maxN; i++) {
+        wchar_t key[8], line[600];
+        wchar_t *bar1, *bar2;
+        swprintf(key, 8, L"%d", i);
+        GetPrivateProfileStringW(L"Programs", key, L"", line, 600, iniPath);
+        trimw(line);
+        if (!line[0])
+            continue;                       /* allow gaps in numbering */
+
+        /* Split "Label | Path | Date" (Date optional). */
+        bar1 = wcschr(line, L'|');
+        if (!bar1) {                        /* no label given: path only */
+            out[n].label[0] = L'\0';
+            wcsncpy(out[n].path, line, MAX_PATH - 1);
+            out[n].path[MAX_PATH - 1] = L'\0';
+            out[n].date[0] = L'\0';
+        } else {
+            *bar1 = L'\0';
+            wcsncpy(out[n].label, line, 79); out[n].label[79] = L'\0';
+            bar2 = wcschr(bar1 + 1, L'|');
+            if (bar2) {
+                *bar2 = L'\0';
+                wcsncpy(out[n].date, bar2 + 1, 63); out[n].date[63] = L'\0';
+            } else {
+                out[n].date[0] = L'\0';
+            }
+            wcsncpy(out[n].path, bar1 + 1, MAX_PATH - 1);
+            out[n].path[MAX_PATH - 1] = L'\0';
+        }
+        trimw(out[n].label);
+        trimw(out[n].path);
+        trimw(out[n].date);
+        if (!out[n].label[0]) {             /* default label = exe name */
+            const wchar_t *base = out[n].path, *p;
+            for (p = out[n].path; *p; ++p)
+                if (*p == L'\\' || *p == L'/') base = p + 1;
+            wcsncpy(out[n].label, base, 79); out[n].label[79] = L'\0';
+        }
+        if (out[n].path[0])
+            n++;
+    }
+    return n;
+}
+
+/* Pick a program: by index (1-based), by label substring, or interactively. */
+static int choose_program(Program *progs, int nprog, const wchar_t *selector)
+{
+    int choice = -1;
+
+    if (nprog <= 0) return -1;
+    if (nprog == 1 && !selector) return 0;
+
+    if (selector && selector[0]) {
+        /* numeric selector? */
+        wchar_t *end = NULL;
+        long v = wcstol(selector, &end, 10);
+        if (end && *end == L'\0' && v >= 1 && v <= nprog)
+            return (int)v - 1;
+        /* else case-insensitive label substring match (first hit) */
+        {
+            int i, hit = -1, hits = 0;
+            for (i = 0; i < nprog; i++) {
+                wchar_t lab[80], sel[80];
+                wcsncpy(lab, progs[i].label, 79); lab[79] = 0;
+                wcsncpy(sel, selector, 79); sel[79] = 0;
+                _wcslwr(lab); _wcslwr(sel);
+                if (wcsstr(lab, sel)) { hit = i; hits++; }
+            }
+            if (hits == 1) return hit;
+            if (hits > 1)
+                wprintf(L"\n\"%ls\" matches more than one program; please choose:\n",
+                        selector);
+            else
+                wprintf(L"\n\"%ls\" matched no program; please choose:\n", selector);
+        }
+    }
+
+    /* Interactive menu. */
+    for (;;) {
+        wchar_t buf[64];
+        int i;
+        long v;
+        wchar_t *end = NULL;
+
+        wprintf(L"\nWhich program would you like to run?\n");
+        for (i = 0; i < nprog; i++)
+            wprintf(L"  %d) %ls\n      %ls\n", i + 1, progs[i].label, progs[i].path);
+        wprintf(L"Enter 1-%d (or Q to quit): ", nprog);
+        fflush(stdout);
+
+        if (!fgetws(buf, 64, stdin))
+            return -1;
+        trimw(buf);
+        if (buf[0] == L'q' || buf[0] == L'Q')
+            return -1;
+        v = wcstol(buf, &end, 10);
+        if (end && *end == L'\0' && v >= 1 && v <= nprog) {
+            choice = (int)v - 1;
+            break;
+        }
+        wprintf(L"  (not a valid choice)\n");
+    }
+    return choice;
+}
+
+/* Hand off to the other-bitness sibling with resolved values (no re-prompt). */
+static int dispatch_to_sibling(const wchar_t *selfDir, const wchar_t *date,
+                               const wchar_t *program, const wchar_t *extra)
 {
     wchar_t sibling[MAX_PATH];
-    wchar_t *cmd;
-    int argcW, i;
-    LPWSTR *argvW;
-    size_t cap;
+    wchar_t cmd[MAX_PATH * 2 + 1152];
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
 
@@ -123,19 +260,13 @@ static int dispatch_to_sibling(const wchar_t *selfDir)
         return 10;
     }
 
-    argvW = CommandLineToArgvW(GetCommandLineW(), &argcW);
-    cap = MAX_PATH + 8;
-    for (i = 1; argvW && i < argcW; i++)
-        cap += wcslen(argvW[i]) + 4;
-    cmd = (wchar_t *)malloc(cap * sizeof(wchar_t));
-    if (!cmd) return 11;
-
-    _snwprintf(cmd, cap, L"\"%ls\"", sibling);
-    for (i = 1; argvW && i < argcW; i++) {
-        wcsncat(cmd, L" \"", cap - wcslen(cmd) - 1);
-        wcsncat(cmd, argvW[i], cap - wcslen(cmd) - 1);
-        wcsncat(cmd, L"\"", cap - wcslen(cmd) - 1);
-    }
+    if (extra && extra[0])
+        _snwprintf(cmd, MAX_PATH * 2 + 1152, L"\"%ls\" \"%ls\" \"%ls\" %ls",
+                   sibling, date, program, extra);
+    else
+        _snwprintf(cmd, MAX_PATH * 2 + 1152, L"\"%ls\" \"%ls\" \"%ls\"",
+                   sibling, date, program);
+    cmd[MAX_PATH * 2 + 1151] = L'\0';
 
     wprintf(L"Target is %ls-bit; handing off to %ls ...\n",
             SELF_IS_64 ? L"32" : L"64", SIBLING_W);
@@ -145,13 +276,11 @@ static int dispatch_to_sibling(const wchar_t *selfDir)
     if (!CreateProcessW(sibling, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
         wprintf(L"ERROR: Could not start %ls (error %lu).\n",
                 SIBLING_W, (unsigned long)GetLastError());
-        free(cmd);
         press_enter_to_exit();
         return 12;
     }
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    free(cmd);
     return 0;
 }
 
@@ -196,7 +325,7 @@ int wmain(int argc, wchar_t **argv)
     wchar_t targetStr[128] = {0}, extraArgs[1024] = {0};
     wchar_t dllPath[MAX_PATH], cmdline[MAX_PATH + 1024], offBuf[64];
     const wchar_t *workdirPtr = NULL;
-    int fromArgs = 0, y, mo, d, h, mi, sec;
+    int y, mo, d, h, mi, sec;
     WORD machine;
     SYSTEMTIME realLocal, stTarget;
     FILETIME ftReal, ftTarget;
@@ -213,30 +342,56 @@ int wmain(int argc, wchar_t **argv)
             SELF_IS_64 ? L"64" : L"32");
     wprintf(L"---------------------------------------------\n");
 
+    if (argc == 2 && (!wcscmp(argv[1], L"/?") || !wcscmp(argv[1], L"-h") ||
+                      !wcscmp(argv[1], L"--help"))) {
+        wprintf(L"\nConfigure SadieDate.ini and double-click, or:\n"
+                L"  SadieDate.exe \"YYYY-MM-DD\" \"C:\\Path\\To\\SADiE.exe\" [args]\n"
+                L"  SadieDate.exe <number|name>   (pick from the [Programs] list)\n");
+        return 0;
+    }
+
     if (argc >= 3) {
-        fromArgs = 1;
+        /* Explicit date + program on the command line. */
         wcsncpy(targetStr, argv[1], 127);
         wcsncpy(program, argv[2], MAX_PATH - 1);
         extraArgs[0] = L'\0';
         { int i; for (i = 3; i < argc; ++i) {
             if (extraArgs[0]) wcsncat(extraArgs, L" ", 1023 - wcslen(extraArgs));
             wcsncat(extraArgs, argv[i], 1023 - wcslen(extraArgs)); } }
-    } else if (argc == 2 && (!wcscmp(argv[1], L"/?") || !wcscmp(argv[1], L"-h") ||
-                             !wcscmp(argv[1], L"--help"))) {
-        wprintf(L"\nConfigure SadieDate.ini and double-click, or:\n"
-                L"  SadieDate.exe \"YYYY-MM-DD\" \"C:\\Path\\To\\SADiE.exe\" [args]\n");
-        return 0;
     } else {
-        GetPrivateProfileStringW(L"SadieDate", L"TargetDate", L"", targetStr, 128, iniPath);
-        GetPrivateProfileStringW(L"SadieDate", L"Program", L"", program, MAX_PATH, iniPath);
-        GetPrivateProfileStringW(L"SadieDate", L"WorkingDir", L"", workdir, MAX_PATH, iniPath);
-        GetPrivateProfileStringW(L"SadieDate", L"Args", L"", extraArgs, 1024, iniPath);
+        /* INI mode. Build the program list; pick one (menu or selector). */
+        Program progs[MAX_PROGRAMS];
+        int nprog, idx;
+        const wchar_t *selector = (argc == 2) ? argv[1] : NULL;
+        wchar_t globalDate[128];
+
+        GetPrivateProfileStringW(L"SadieDate", L"TargetDate", L"",
+                                 globalDate, 128, iniPath);
+        GetPrivateProfileStringW(L"SadieDate", L"WorkingDir", L"",
+                                 workdir, MAX_PATH, iniPath);
+        GetPrivateProfileStringW(L"SadieDate", L"Args", L"",
+                                 extraArgs, 1024, iniPath);
+
+        nprog = gather_programs(iniPath, progs, MAX_PROGRAMS);
+        if (nprog == 0) {
+            /* Fall back to the single Program= line. */
+            GetPrivateProfileStringW(L"SadieDate", L"Program", L"",
+                                     program, MAX_PATH, iniPath);
+            wcsncpy(targetStr, globalDate, 127);
+        } else {
+            idx = choose_program(progs, nprog, selector);
+            if (idx < 0) { wprintf(L"\nCancelled.\n"); return 0; }
+            wcsncpy(program, progs[idx].path, MAX_PATH - 1);
+            program[MAX_PATH - 1] = L'\0';
+            wcsncpy(targetStr, progs[idx].date[0] ? progs[idx].date : globalDate, 127);
+            targetStr[127] = L'\0';
+        }
     }
 
     if (!targetStr[0] || !program[0]) {
-        wprintf(L"\nERROR: No configuration found.\n");
-        if (!fromArgs)
-            wprintf(L"Edit SadieDate.ini (at %ls) and set TargetDate and Program.\n", iniPath);
+        wprintf(L"\nERROR: No configuration found.\n"
+                L"Edit SadieDate.ini (at %ls): set TargetDate and either a\n"
+                L"Program= line or a [Programs] list.\n", iniPath);
         press_enter_to_exit();
         return 2;
     }
@@ -247,7 +402,8 @@ int wmain(int argc, wchar_t **argv)
         return 2;
     }
     if (GetFileAttributesW(program) == INVALID_FILE_ATTRIBUTES) {
-        wprintf(L"\nERROR: Program not found:\n  %ls\n", program);
+        wprintf(L"\nERROR: Program not found:\n  %ls\n"
+                L"Check the path in SadieDate.ini.\n", program);
         press_enter_to_exit();
         return 3;
     }
@@ -255,9 +411,9 @@ int wmain(int argc, wchar_t **argv)
     /* If the target is the other bitness, hand off to the sibling build. */
     machine = read_machine(program);
     if (machine == IMAGE_FILE_MACHINE_AMD64 && !SELF_IS_64)
-        return dispatch_to_sibling(selfDir);
+        return dispatch_to_sibling(selfDir, targetStr, program, extraArgs);
     if (machine == IMAGE_FILE_MACHINE_I386 && SELF_IS_64)
-        return dispatch_to_sibling(selfDir);
+        return dispatch_to_sibling(selfDir, targetStr, program, extraArgs);
 
     /* Locate the matching hook DLL next to us. */
     _snwprintf(dllPath, MAX_PATH, L"%ls%ls", selfDir, HOOK_DLL_W);
@@ -270,7 +426,7 @@ int wmain(int argc, wchar_t **argv)
         return 4;
     }
 
-    /* Compute the constant offset = real_now - target (a duration, in 100ns). */
+    /* Constant offset = real_now - target (a duration, in 100ns). */
     GetLocalTime(&realLocal);
     stTarget = realLocal;
     stTarget.wYear = (WORD)y; stTarget.wMonth = (WORD)mo; stTarget.wDay = (WORD)d;
@@ -304,7 +460,6 @@ int wmain(int argc, wchar_t **argv)
             stTarget.wHour, stTarget.wMinute);
     wprintf(L"Launching:              %ls\n", program);
 
-    /* Working directory: explicit, else the program's own folder. */
     if (workdir[0]) workdirPtr = workdir;
     else if (dir_of_path(program, workdir, MAX_PATH)) workdirPtr = workdir;
 
@@ -334,8 +489,5 @@ int wmain(int argc, wchar_t **argv)
     ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
-
-    /* Nothing to clean up: the real clock was never touched. We can exit now;
-     * the shim lives inside the target for as long as it runs. */
     return 0;
 }
