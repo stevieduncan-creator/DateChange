@@ -1,16 +1,21 @@
 # Build output
 /build/
+/alt-clock-rollback/build/
 *.o
 *.obj
 *.res
 *.res.o
-*.exe
 *.pdb
 *.ilk
 
-# ...but DO ship the prebuilt binary in dist/
+# Ignore stray binaries everywhere...
+*.exe
+*.dll
+
+# ...but DO ship the prebuilt binaries in dist/
 !dist/
-!dist/SadieDate.exe
+!dist/*.exe
+!dist/*.dll
 
 # Editor / OS cruft
 *~
