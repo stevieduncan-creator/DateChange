@@ -39,6 +39,32 @@
 #include <windows.h>
 #include <winternl.h>
 #include <stdlib.h>
+#include <stdio.h>
+
+/* ---- optional diagnostic log (path from env SADIEDATE_LOG) ---------------- */
+static char g_logpath[MAX_PATH] = {0};
+static void logline(const char *fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+    HANDLE f;
+    DWORD wr;
+    int n;
+    if (!g_logpath[0]) return;
+    va_start(ap, fmt);
+    n = _vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
+    va_end(ap);
+    if (n < 0) n = (int)sizeof(buf) - 2;
+    buf[n++] = '\r'; buf[n++] = '\n';
+    f = CreateFileA(g_logpath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f != INVALID_HANDLE_VALUE) {
+        SetFilePointer(f, 0, NULL, FILE_END);
+        WriteFile(f, buf, (DWORD)n, &wr, NULL);
+        CloseHandle(f);
+    }
+}
+static unsigned g_modCount = 0, g_slotCount = 0;   /* diagnostics */
 
 /* The constant offset, in 100-ns units, to SUBTRACT from every date read.
  * Positive => the process sees an earlier date. 0 => shim disabled. */
@@ -210,6 +236,7 @@ static void patch_slot(void **slot, void *rep)
     if (VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old)) {
         *slot = rep;
         VirtualProtect(slot, sizeof(void *), old, &old);
+        g_slotCount++;
     }
 }
 
@@ -275,8 +302,10 @@ static void patch_all_modules(void)
     for (it = head->Flink; it && it != head; it = it->Flink) {
         LDR_DATA_TABLE_ENTRY *e =
             CONTAINING_RECORD(it, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
-        if (e->DllBase)
+        if (e->DllBase) {
+            g_modCount++;
             patch_module((BYTE *)e->DllBase);
+        }
     }
 }
 
@@ -287,13 +316,21 @@ static BOOL init_shim(void)
     char buf[64];
     DWORD n;
 
+    /* Diagnostic log path (optional). Read first so we can log everything. */
+    GetEnvironmentVariableA("SADIEDATE_LOG", g_logpath, sizeof(g_logpath));
+    logline("hook: DllMain attach, pid=%lu", (unsigned long)GetCurrentProcessId());
+
     /* Read the offset the launcher passed us. Absent/zero => stay disabled. */
     n = GetEnvironmentVariableA("SADIEDATE_OFFSET", buf, sizeof(buf));
-    if (n == 0 || n >= sizeof(buf))
+    if (n == 0 || n >= sizeof(buf)) {
+        logline("hook: SADIEDATE_OFFSET not set -> shim disabled");
         return FALSE;
+    }
     g_offset = _strtoi64(buf, NULL, 10);
-    if (g_offset == 0)
+    if (g_offset == 0) {
+        logline("hook: offset is 0 -> shim disabled");
         return FALSE;
+    }
 
     /* Optional: which functions to hook. Absent => hook everything. */
     n = GetEnvironmentVariableA("SADIEDATE_HOOKS", buf, sizeof(buf));
@@ -350,7 +387,17 @@ static BOOL init_shim(void)
     add_pair((void *)real_LoadLibraryExA,                 (void *)my_LoadLibraryExA);
     add_pair((void *)real_LoadLibraryExW,                 (void *)my_LoadLibraryExW);
 
+    logline("hook: offset=%lld mask=0x%02x GetLocalTime=%p GetSystemTime=%p "
+            "GSTAFT=%p NtQuery=%p pairs=%d",
+            (long long)g_offset, g_mask,
+            (void *)real_GetLocalTime, (void *)real_GetSystemTime,
+            (void *)real_GetSystemTimeAsFileTime, (void *)real_NtQuerySystemTime,
+            g_npairs);
+
     patch_all_modules();
+
+    logline("hook: patched %u IAT slot(s) across %u module(s) -> shim ACTIVE",
+            g_slotCount, g_modCount);
     return TRUE;
 }
 

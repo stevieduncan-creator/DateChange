@@ -43,7 +43,38 @@
 #include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <wchar.h>
+
+/* ---- optional diagnostics (INI: [SadieDate] Debug=1) --------------------- */
+static int     g_debug = 0;
+static wchar_t g_logpathW[MAX_PATH] = {0};
+static void jlog(const char *fmt, ...)
+{
+    char buf[512], line[520];
+    va_list ap;
+    int n;
+    va_start(ap, fmt);
+    n = _vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
+    va_end(ap);
+    if (n < 0) n = (int)sizeof(buf) - 1;
+    buf[n] = '\0';
+    if (g_debug)
+        wprintf(L"  [debug] %hs\n", buf);
+    if (g_logpathW[0]) {
+        HANDLE f = CreateFileW(g_logpathW, FILE_APPEND_DATA,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (f != INVALID_HANDLE_VALUE) {
+            DWORD wr;
+            int m = _snprintf(line, sizeof(line) - 1, "%s\r\n", buf);
+            if (m < 0) m = (int)sizeof(line) - 1;
+            SetFilePointer(f, 0, NULL, FILE_END);
+            WriteFile(f, line, (DWORD)m, &wr, NULL);
+            CloseHandle(f);
+        }
+    }
+}
 
 #ifdef _WIN64
 #  define SELF_IS_64   1
@@ -319,19 +350,30 @@ static BOOL inject(HANDLE hProc, const wchar_t *dllPath)
     k32 = GetModuleHandleW(L"kernel32.dll");
     if (!k32) return FALSE;
     pLoadLib = GetProcAddress(k32, "LoadLibraryW");
-    if (!pLoadLib) return FALSE;
+    if (!pLoadLib) { jlog("inject: no LoadLibraryW?!"); return FALSE; }
 
     remote = VirtualAllocEx(hProc, NULL, bytes, MEM_COMMIT | MEM_RESERVE,
                             PAGE_READWRITE);
-    if (!remote) return FALSE;
+    if (!remote) {
+        jlog("inject: VirtualAllocEx failed, err=%lu", (unsigned long)GetLastError());
+        return FALSE;
+    }
 
-    if (WriteProcessMemory(hProc, remote, dllPath, bytes, NULL)) {
+    if (!WriteProcessMemory(hProc, remote, dllPath, bytes, NULL)) {
+        jlog("inject: WriteProcessMemory failed, err=%lu", (unsigned long)GetLastError());
+    } else {
         hThread = CreateRemoteThread(hProc, NULL, 0,
                       (LPTHREAD_START_ROUTINE)pLoadLib, remote, 0, NULL);
-        if (hThread) {
-            WaitForSingleObject(hThread, 15000);
+        if (!hThread) {
+            jlog("inject: CreateRemoteThread failed, err=%lu",
+                 (unsigned long)GetLastError());
+        } else {
+            DWORD w = WaitForSingleObject(hThread, 15000);
             GetExitCodeThread(hThread, &exitCode);  /* nonzero HMODULE = loaded */
             ok = (exitCode != 0);
+            jlog("inject: remote thread wait=%lu LoadLibrary returned HMODULE=0x%lx (%s)",
+                 (unsigned long)w, (unsigned long)exitCode,
+                 ok ? "loaded" : "FAILED to load DLL");
             CloseHandle(hThread);
         }
     }
@@ -372,6 +414,23 @@ int wmain(int argc, wchar_t **argv)
         _snwprintf(hbuf, 16, L"%u", map_hooklevel(hookLevel));
         SetEnvironmentVariableW(L"SADIEDATE_HOOKS", hbuf);
     }
+
+    /* Diagnostics. Debug=1 in the INI, or SADIEDATE_LOG already set, turns on a
+     * log file next to this exe and step-by-step injection reporting. */
+    g_debug = (int)GetPrivateProfileIntW(L"SadieDate", L"Debug", 0, iniPath);
+    if (GetEnvironmentVariableW(L"SADIEDATE_LOG", g_logpathW, MAX_PATH) == 0) {
+        if (g_debug) {
+            _snwprintf(g_logpathW, MAX_PATH, L"%lsSadieDate-log.txt", selfDir);
+            g_logpathW[MAX_PATH - 1] = L'\0';
+            DeleteFileW(g_logpathW);                 /* start fresh */
+            SetEnvironmentVariableW(L"SADIEDATE_LOG", g_logpathW); /* child logs too */
+        }
+    } else {
+        g_debug = 1;   /* a log path was provided by a parent launcher */
+    }
+    if (g_debug)
+        wprintf(L"(debug on; log: %ls)\n", g_logpathW);
+    jlog("launcher: start (%d-bit)", SELF_IS_64 ? 64 : 32);
 
     if (argc == 2 && (!wcscmp(argv[1], L"/?") || !wcscmp(argv[1], L"-h") ||
                       !wcscmp(argv[1], L"--help"))) {
@@ -510,11 +569,16 @@ int wmain(int argc, wchar_t **argv)
         return 6;
     }
 
+    jlog("launcher: target=%ls machine=0x%x offset=%lld dll=%ls",
+         program, machine, (long long)offset, dllPath);
+
     if (inject(pi.hProcess, dllPath)) {
         wprintf(L"\nDate shim installed. Resuming the program.\n");
+        jlog("launcher: inject OK");
     } else {
-        wprintf(L"\nWARNING: Could not install the date shim; the program will\n"
-                L"         start with the REAL date (it may hit its date check).\n");
+        wprintf(L"\n*** WARNING: Could not install the date shim. The program will\n"
+                L"    start with the REAL date (it may hit its date check). ***\n");
+        jlog("launcher: inject FAILED");
     }
 
     ResumeThread(pi.hThread);
