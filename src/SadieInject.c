@@ -81,6 +81,27 @@ static void trimw(wchar_t *s)
                      e[-1] == L'\r' || e[-1] == L'\n')) *--e = L'\0';
 }
 
+/* Map a HookLevel name (or number) to the function bitmask. Bits:
+ * 1 GetLocalTime, 2 GetSystemTime, 4 GetSystemTimeAsFileTime,
+ * 8 GetSystemTimePreciseAsFileTime, 16 NtQuerySystemTime. */
+static unsigned map_hooklevel(const wchar_t *s)
+{
+    wchar_t t[32];
+    wchar_t *end = NULL;
+    unsigned long v;
+
+    wcsncpy(t, s ? s : L"", 31); t[31] = L'\0';
+    trimw(t); _wcslwr(t);
+
+    if (!t[0] || !wcscmp(t, L"full"))     return 0x1F;  /* everything */
+    if (!wcscmp(t, L"safe"))              return 0x07;  /* no NtQuery, no Precise */
+    if (!wcscmp(t, L"minimal"))           return 0x03;  /* GetLocalTime+GetSystemTime */
+    if (!wcscmp(t, L"calendar"))          return 0x01;  /* GetLocalTime only */
+    v = wcstoul(t, &end, 0);
+    if (end && *end == L'\0' && v != 0)   return (unsigned)(v & 0x1F);
+    return 0x1F;
+}
+
 /* Parse "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS" (also accepts / or .). */
 static int parse_target(const wchar_t *s,
                         int *y, int *mo, int *d, int *h, int *mi, int *sec)
@@ -341,6 +362,16 @@ int wmain(int argc, wchar_t **argv)
     wprintf(L"SadieDate - date-only shim launcher (%ls-bit)\n",
             SELF_IS_64 ? L"64" : L"32");
     wprintf(L"---------------------------------------------\n");
+
+    /* Which date functions the shim should hook. Set it once here so it is
+     * inherited by SADiE (and by the sibling launcher across a hand-off). */
+    {
+        wchar_t hookLevel[32], hbuf[16];
+        GetPrivateProfileStringW(L"SadieDate", L"HookLevel", L"full",
+                                 hookLevel, 32, iniPath);
+        _snwprintf(hbuf, 16, L"%u", map_hooklevel(hookLevel));
+        SetEnvironmentVariableW(L"SADIEDATE_HOOKS", hbuf);
+    }
 
     if (argc == 2 && (!wcscmp(argv[1], L"/?") || !wcscmp(argv[1], L"-h") ||
                       !wcscmp(argv[1], L"--help"))) {

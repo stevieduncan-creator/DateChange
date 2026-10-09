@@ -47,6 +47,17 @@ static HMODULE  g_self = NULL;
 static BYTE    *g_k32base = NULL;     /* never patch these two: our stubs call */
 static BYTE    *g_ntdllbase = NULL;   /* their real funcs; keep them un-offset */
 
+/* Which date functions to hook (bitmask from SADIEDATE_HOOKS). Lets us fool a
+ * license/date check without touching functions a hardware driver's I/O path
+ * may rely on (e.g. GetSystemTimeAsFileTime / NtQuerySystemTime). */
+#define HOOK_LOCALTIME        0x01   /* GetLocalTime                      */
+#define HOOK_SYSTEMTIME       0x02   /* GetSystemTime                     */
+#define HOOK_SYSTEMTIME_FT    0x04   /* GetSystemTimeAsFileTime           */
+#define HOOK_SYSTEMTIME_PREC  0x08   /* GetSystemTimePreciseAsFileTime    */
+#define HOOK_NTQUERY          0x10   /* NtQuerySystemTime                 */
+#define HOOK_ALL              0x1F
+static unsigned g_mask = HOOK_ALL;
+
 /* ---- real function pointers (the genuine implementations) ---------------- */
 typedef void (WINAPI *GetSystemTime_t)(LPSYSTEMTIME);
 typedef void (WINAPI *GetLocalTime_t)(LPSYSTEMTIME);
@@ -130,14 +141,18 @@ static FARPROC WINAPI my_GetProcAddress(HMODULE mod, LPCSTR name)
     FARPROC r = real_GetProcAddress(mod, name);
     /* Only intercept by-name lookups (ordinals have a zero HIWORD). */
     if (name && ((ULONG_PTR)name >> 16) != 0) {
-        if (r == (FARPROC)real_GetSystemTime)             return (FARPROC)my_GetSystemTime;
-        if (r == (FARPROC)real_GetLocalTime)              return (FARPROC)my_GetLocalTime;
-        if (r == (FARPROC)real_GetSystemTimeAsFileTime)   return (FARPROC)my_GetSystemTimeAsFileTime;
-        if (real_GetSystemTimePreciseAsFileTime &&
+        if ((g_mask & HOOK_SYSTEMTIME) && r == (FARPROC)real_GetSystemTime)
+            return (FARPROC)my_GetSystemTime;
+        if ((g_mask & HOOK_LOCALTIME) && r == (FARPROC)real_GetLocalTime)
+            return (FARPROC)my_GetLocalTime;
+        if ((g_mask & HOOK_SYSTEMTIME_FT) && r == (FARPROC)real_GetSystemTimeAsFileTime)
+            return (FARPROC)my_GetSystemTimeAsFileTime;
+        if ((g_mask & HOOK_SYSTEMTIME_PREC) && real_GetSystemTimePreciseAsFileTime &&
             r == (FARPROC)real_GetSystemTimePreciseAsFileTime)
             return (FARPROC)my_GetSystemTimePreciseAsFileTime;
-        if (real_NtQuerySystemTime &&
-            r == (FARPROC)real_NtQuerySystemTime)          return (FARPROC)my_NtQuerySystemTime;
+        if ((g_mask & HOOK_NTQUERY) && real_NtQuerySystemTime &&
+            r == (FARPROC)real_NtQuerySystemTime)
+            return (FARPROC)my_NtQuerySystemTime;
     }
     return r;
 }
@@ -280,6 +295,14 @@ static BOOL init_shim(void)
     if (g_offset == 0)
         return FALSE;
 
+    /* Optional: which functions to hook. Absent => hook everything. */
+    n = GetEnvironmentVariableA("SADIEDATE_HOOKS", buf, sizeof(buf));
+    if (n > 0 && n < sizeof(buf)) {
+        unsigned m = (unsigned)strtoul(buf, NULL, 10);
+        if (m != 0)
+            g_mask = m & HOOK_ALL;
+    }
+
     k32 = GetModuleHandleW(L"kernel32.dll");
     if (!k32)
         return FALSE;
@@ -308,12 +331,19 @@ static BOOL init_shim(void)
         real_NtQuerySystemTime = (NtQuerySystemTime_t)
             real_GetProcAddress(ntdll, "NtQuerySystemTime");
 
-    /* Build the real->stub table (NULLs are skipped by add_pair). */
-    add_pair((void *)real_GetSystemTime,                  (void *)my_GetSystemTime);
-    add_pair((void *)real_GetLocalTime,                   (void *)my_GetLocalTime);
-    add_pair((void *)real_GetSystemTimeAsFileTime,        (void *)my_GetSystemTimeAsFileTime);
-    add_pair((void *)real_GetSystemTimePreciseAsFileTime, (void *)my_GetSystemTimePreciseAsFileTime);
-    add_pair((void *)real_NtQuerySystemTime,              (void *)my_NtQuerySystemTime);
+    /* Build the real->stub table (NULLs are skipped by add_pair). Only the
+     * date functions enabled by the mask are hooked; GetProcAddress and
+     * LoadLibrary* are always hooked so the enabled ones stay fully covered. */
+    if (g_mask & HOOK_SYSTEMTIME)
+        add_pair((void *)real_GetSystemTime,                  (void *)my_GetSystemTime);
+    if (g_mask & HOOK_LOCALTIME)
+        add_pair((void *)real_GetLocalTime,                   (void *)my_GetLocalTime);
+    if (g_mask & HOOK_SYSTEMTIME_FT)
+        add_pair((void *)real_GetSystemTimeAsFileTime,        (void *)my_GetSystemTimeAsFileTime);
+    if (g_mask & HOOK_SYSTEMTIME_PREC)
+        add_pair((void *)real_GetSystemTimePreciseAsFileTime, (void *)my_GetSystemTimePreciseAsFileTime);
+    if (g_mask & HOOK_NTQUERY)
+        add_pair((void *)real_NtQuerySystemTime,              (void *)my_NtQuerySystemTime);
     add_pair((void *)real_GetProcAddress,                 (void *)my_GetProcAddress);
     add_pair((void *)real_LoadLibraryA,                   (void *)my_LoadLibraryA);
     add_pair((void *)real_LoadLibraryW,                   (void *)my_LoadLibraryW);
