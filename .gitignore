@@ -1,0 +1,18 @@
+# Build output
+/build/
+*.o
+*.obj
+*.res
+*.res.o
+*.exe
+*.pdb
+*.ilk
+
+# ...but DO ship the prebuilt binary in dist/
+!dist/
+!dist/SadieDate.exe
+
+# Editor / OS cruft
+*~
+Thumbs.db
+.DS_Store
