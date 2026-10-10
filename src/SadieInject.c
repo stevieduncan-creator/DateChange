@@ -322,15 +322,18 @@ static int dispatch_to_sibling(const wchar_t *selfDir, const wchar_t *date,
 
     wprintf(L"Target is %ls-bit; handing off to %ls ...\n",
             SELF_IS_64 ? L"32" : L"64", SIBLING_W);
+    jlog("launcher: handing off to sibling %ls for %ls", SIBLING_W, program);
 
     ZeroMemory(&si, sizeof si); si.cb = sizeof si;
     ZeroMemory(&pi, sizeof pi);
     if (!CreateProcessW(sibling, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        jlog("launcher: sibling launch FAILED err=%lu", (unsigned long)GetLastError());
         wprintf(L"ERROR: Could not start %ls (error %lu).\n",
                 SIBLING_W, (unsigned long)GetLastError());
         press_enter_to_exit();
         return 12;
     }
+    jlog("launcher: sibling launched OK");
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     return 0;
@@ -414,6 +417,11 @@ int wmain(int argc, wchar_t **argv)
         _snwprintf(hbuf, 16, L"%u", map_hooklevel(hookLevel));
         SetEnvironmentVariableW(L"SADIEDATE_HOOKS", hbuf);
     }
+    /* Hook GetProcAddress/LoadLibrary too? (default yes; 0 = less invasive) */
+    {
+        int dyn = (int)GetPrivateProfileIntW(L"SadieDate", L"HookDynamic", 1, iniPath);
+        SetEnvironmentVariableW(L"SADIEDATE_DYN", dyn ? L"1" : L"0");
+    }
 
     /* Diagnostics. Debug=1 in the INI, or SADIEDATE_LOG already set, turns on a
      * log file next to this exe and step-by-step injection reporting. */
@@ -478,7 +486,10 @@ int wmain(int argc, wchar_t **argv)
         }
     }
 
+    jlog("launcher: resolved program=[%ls] date=[%ls]", program, targetStr);
+
     if (!targetStr[0] || !program[0]) {
+        jlog("launcher: no program/date configured");
         wprintf(L"\nERROR: No configuration found.\n"
                 L"Edit SadieDate.ini (at %ls): set TargetDate and either a\n"
                 L"Program= line or a [Programs] list.\n", iniPath);
@@ -500,6 +511,7 @@ int wmain(int argc, wchar_t **argv)
 
     /* If the target is the other bitness, hand off to the sibling build. */
     machine = read_machine(program);
+    jlog("launcher: target machine=0x%x (self is %d-bit)", machine, SELF_IS_64 ? 64 : 32);
     if (machine == IMAGE_FILE_MACHINE_AMD64 && !SELF_IS_64)
         return dispatch_to_sibling(selfDir, targetStr, program, extraArgs);
     if (machine == IMAGE_FILE_MACHINE_I386 && SELF_IS_64)
@@ -559,15 +571,18 @@ int wmain(int argc, wchar_t **argv)
         _snwprintf(cmdline, MAX_PATH + 1024, L"\"%ls\"", program);
     cmdline[MAX_PATH + 1023] = L'\0';
 
+    jlog("launcher: CreateProcess (suspended): %ls", program);
     ZeroMemory(&si, sizeof si); si.cb = sizeof si;
     ZeroMemory(&pi, sizeof pi);
     if (!CreateProcessW(program, cmdline, NULL, NULL, FALSE,
                         CREATE_SUSPENDED, NULL, workdirPtr, &si, &pi)) {
+        jlog("launcher: CreateProcess FAILED err=%lu", (unsigned long)GetLastError());
         wprintf(L"\nERROR: Failed to launch the program (error %lu).\n",
                 (unsigned long)GetLastError());
         press_enter_to_exit();
         return 6;
     }
+    jlog("launcher: process created, pid=%lu", (unsigned long)pi.dwProcessId);
 
     jlog("launcher: target=%ls machine=0x%x offset=%lld dll=%ls",
          program, machine, (long long)offset, dllPath);
@@ -582,6 +597,7 @@ int wmain(int argc, wchar_t **argv)
     }
 
     ResumeThread(pi.hThread);
+    jlog("launcher: resumed target, launcher exiting normally");
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return 0;

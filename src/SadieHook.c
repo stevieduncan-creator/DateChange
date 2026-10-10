@@ -84,6 +84,11 @@ static BYTE    *g_ntdllbase = NULL;   /* their real funcs; keep them un-offset *
 #define HOOK_ALL              0x1F
 static unsigned g_mask = HOOK_ALL;
 
+/* Hook GetProcAddress + LoadLibrary* too (covers dynamically-resolved calls and
+ * plugins loaded later)? This is the most invasive part; SADIEDATE_DYN=0 turns
+ * it off, leaving only the already-loaded modules' date imports patched. */
+static int g_dyn = 1;
+
 /* ---- real function pointers (the genuine implementations) ---------------- */
 typedef void (WINAPI *GetSystemTime_t)(LPSYSTEMTIME);
 typedef void (WINAPI *GetLocalTime_t)(LPSYSTEMTIME);
@@ -339,6 +344,10 @@ static BOOL init_shim(void)
         if (m != 0)
             g_mask = m & HOOK_ALL;
     }
+    /* Optional: hook GetProcAddress/LoadLibrary too (default yes). */
+    n = GetEnvironmentVariableA("SADIEDATE_DYN", buf, sizeof(buf));
+    if (n > 0 && n < sizeof(buf))
+        g_dyn = (strtoul(buf, NULL, 10) != 0);
 
     k32 = GetModuleHandleW(L"kernel32.dll");
     if (!k32)
@@ -381,15 +390,17 @@ static BOOL init_shim(void)
         add_pair((void *)real_GetSystemTimePreciseAsFileTime, (void *)my_GetSystemTimePreciseAsFileTime);
     if (g_mask & HOOK_NTQUERY)
         add_pair((void *)real_NtQuerySystemTime,              (void *)my_NtQuerySystemTime);
-    add_pair((void *)real_GetProcAddress,                 (void *)my_GetProcAddress);
-    add_pair((void *)real_LoadLibraryA,                   (void *)my_LoadLibraryA);
-    add_pair((void *)real_LoadLibraryW,                   (void *)my_LoadLibraryW);
-    add_pair((void *)real_LoadLibraryExA,                 (void *)my_LoadLibraryExA);
-    add_pair((void *)real_LoadLibraryExW,                 (void *)my_LoadLibraryExW);
+    if (g_dyn) {
+        add_pair((void *)real_GetProcAddress,             (void *)my_GetProcAddress);
+        add_pair((void *)real_LoadLibraryA,               (void *)my_LoadLibraryA);
+        add_pair((void *)real_LoadLibraryW,               (void *)my_LoadLibraryW);
+        add_pair((void *)real_LoadLibraryExA,             (void *)my_LoadLibraryExA);
+        add_pair((void *)real_LoadLibraryExW,             (void *)my_LoadLibraryExW);
+    }
 
-    logline("hook: offset=%lld mask=0x%02x GetLocalTime=%p GetSystemTime=%p "
+    logline("hook: offset=%lld mask=0x%02x dyn=%d GetLocalTime=%p GetSystemTime=%p "
             "GSTAFT=%p NtQuery=%p pairs=%d",
-            (long long)g_offset, g_mask,
+            (long long)g_offset, g_mask, g_dyn,
             (void *)real_GetLocalTime, (void *)real_GetSystemTime,
             (void *)real_GetSystemTimeAsFileTime, (void *)real_NtQuerySystemTime,
             g_npairs);
