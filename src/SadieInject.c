@@ -46,7 +46,7 @@
 #include <stdarg.h>
 #include <wchar.h>
 
-#define SADIEDATE_BUILD "2026-10-10e"
+#define SADIEDATE_BUILD "2026-10-10f"
 
 /* ---- optional diagnostics (INI: [SadieDate] Debug=1) --------------------- */
 static int     g_debug = 0;
@@ -571,7 +571,7 @@ int wmain(int argc, wchar_t **argv)
         return 5;
     }
 
-    _snwprintf(offBuf, 64, L"%lld", (long long)offset);
+    _snwprintf(offBuf, 64, L"%I64d", (__int64)offset);     /* %I64d: XP msvcrt-safe */
     SetEnvironmentVariableW(L"SADIEDATE_OFFSET", offBuf);   /* child inherits this */
 
     wprintf(L"\nReal date (unchanged):  %04d-%02d-%02d %02d:%02d\n",
@@ -604,8 +604,8 @@ int wmain(int argc, wchar_t **argv)
     }
     jlog("launcher: process created, pid=%lu", (unsigned long)pi.dwProcessId);
 
-    jlog("launcher: target=%ls machine=0x%x offset=%lld dll=%ls",
-         program, machine, (long long)offset, dllPath);
+    jlog("launcher: target=%ls machine=0x%x offsetSec=%lu dll=%ls",
+         program, machine, (unsigned long)(offset / 10000000), dllPath);
 
     if (inject(pi.hProcess, dllPath)) {
         wprintf(L"\nDate shim installed. Resuming the program.\n");

@@ -65,7 +65,7 @@ static void logline(const char *fmt, ...)
     }
 }
 static unsigned g_modCount = 0, g_slotCount = 0;   /* diagnostics */
-#define SADIEDATE_BUILD "2026-10-10e"
+#define SADIEDATE_BUILD "2026-10-10f"
 
 /* Log the first few access violations anywhere in the process, with the faulting
  * address, so we can tell whether a crash is inside this shim or in the host. */
@@ -420,9 +420,9 @@ static BOOL init_shim(void)
         add_pair((void *)real_LoadLibraryExW,             (void *)my_LoadLibraryExW);
     }
 
-    logline("hook: offset=%lld mask=0x%02x dyn=%d GetLocalTime=%p GetSystemTime=%p "
+    logline("hook: offsetSec=%lu mask=0x%02x dyn=%d GetLocalTime=%p GetSystemTime=%p "
             "GSTAFT=%p NtQuery=%p pairs=%d",
-            (long long)g_offset, g_mask, g_dyn,
+            (unsigned long)(g_offset / 10000000), g_mask, g_dyn,
             (void *)real_GetLocalTime, (void *)real_GetSystemTime,
             (void *)real_GetSystemTimeAsFileTime, (void *)real_NtQuerySystemTime,
             g_npairs);
