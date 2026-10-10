@@ -46,7 +46,7 @@
 #include <stdarg.h>
 #include <wchar.h>
 
-#define SADIEDATE_BUILD "2026-10-10f"
+#define SADIEDATE_BUILD "2026-10-10g"
 
 /* ---- optional diagnostics (INI: [SadieDate] Debug=1) --------------------- */
 static int     g_debug = 0;
@@ -64,7 +64,7 @@ static void jlog(const char *fmt, ...)
     if (g_debug)
         wprintf(L"  [debug] %hs\n", buf);
     if (g_logpathW[0]) {
-        HANDLE f = CreateFileW(g_logpathW, FILE_APPEND_DATA,
+        HANDLE f = CreateFileW(g_logpathW, GENERIC_WRITE,
                                FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                                OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (f != INVALID_HANDLE_VALUE) {
@@ -73,6 +73,7 @@ static void jlog(const char *fmt, ...)
             if (m < 0) m = (int)sizeof(line) - 1;
             SetFilePointer(f, 0, NULL, FILE_END);
             WriteFile(f, line, (DWORD)m, &wr, NULL);
+            FlushFileBuffers(f);
             CloseHandle(f);
         }
     }
@@ -607,17 +608,44 @@ int wmain(int argc, wchar_t **argv)
     jlog("launcher: target=%ls machine=0x%x offsetSec=%lu dll=%ls",
          program, machine, (unsigned long)(offset / 10000000), dllPath);
 
-    if (inject(pi.hProcess, dllPath)) {
-        wprintf(L"\nDate shim installed. Resuming the program.\n");
-        jlog("launcher: inject OK");
-    } else {
-        wprintf(L"\n*** WARNING: Could not install the date shim. The program will\n"
-                L"    start with the REAL date (it may hit its date check). ***\n");
-        jlog("launcher: inject FAILED");
+    /* Debug self-test: can the DLL load in THIS (already-initialised) process?
+     * If yes here but not in the target, the target failure is the suspended
+     * loader, not the DLL itself. Left loaded; the launcher exits momentarily. */
+    if (g_debug) {
+        HMODULE selftest = LoadLibraryW(dllPath);
+        jlog("launcher: self-load test: %s (err=%lu)",
+             selftest ? "DLL loads OK in launcher" : "DLL FAILED to load in launcher",
+             selftest ? 0UL : (unsigned long)GetLastError());
     }
 
-    ResumeThread(pi.hThread);
-    jlog("launcher: resumed target, launcher exiting normally");
+    {
+        BOOL injected = inject(pi.hProcess, dllPath);   /* try while suspended */
+        if (injected) {
+            jlog("launcher: inject OK (pre-resume)");
+            ResumeThread(pi.hThread);
+        } else {
+            /* On Windows XP the loader isn't initialised while the process is
+             * suspended, so LoadLibrary fails. Resume to initialise it, then
+             * retry quickly (SADiE's date check comes after its hardware init). */
+            int t;
+            jlog("launcher: pre-resume inject failed; resuming then retrying");
+            ResumeThread(pi.hThread);
+            for (t = 0; t < 25 && !injected; ++t) {
+                injected = inject(pi.hProcess, dllPath);
+                if (!injected) Sleep(50);
+            }
+            jlog("launcher: post-resume inject %s after %d tr%s",
+                 injected ? "OK" : "FAILED", t, t == 1 ? "y" : "ies");
+        }
+
+        if (injected)
+            wprintf(L"\nDate shim installed.\n");
+        else
+            wprintf(L"\n*** WARNING: Could not install the date shim. The program\n"
+                    L"    started with the REAL date (it may hit its date check). ***\n");
+    }
+
+    jlog("launcher: launcher exiting normally");
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return 0;

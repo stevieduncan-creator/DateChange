@@ -56,16 +56,17 @@ static void logline(const char *fmt, ...)
     va_end(ap);
     if (n < 0) n = (int)sizeof(buf) - 2;
     buf[n++] = '\r'; buf[n++] = '\n';
-    f = CreateFileA(g_logpath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    f = CreateFileA(g_logpath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                     NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f != INVALID_HANDLE_VALUE) {
         SetFilePointer(f, 0, NULL, FILE_END);
         WriteFile(f, buf, (DWORD)n, &wr, NULL);
+        FlushFileBuffers(f);
         CloseHandle(f);
     }
 }
 static unsigned g_modCount = 0, g_slotCount = 0;   /* diagnostics */
-#define SADIEDATE_BUILD "2026-10-10f"
+#define SADIEDATE_BUILD "2026-10-10g"
 
 /* Log the first few access violations anywhere in the process, with the faulting
  * address, so we can tell whether a crash is inside this shim or in the host. */
