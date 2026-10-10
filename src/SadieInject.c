@@ -46,6 +46,8 @@
 #include <stdarg.h>
 #include <wchar.h>
 
+#define SADIEDATE_BUILD "2026-10-10e"
+
 /* ---- optional diagnostics (INI: [SadieDate] Debug=1) --------------------- */
 static int     g_debug = 0;
 static wchar_t g_logpathW[MAX_PATH] = {0};
@@ -74,6 +76,18 @@ static void jlog(const char *fmt, ...)
             CloseHandle(f);
         }
     }
+}
+
+/* Last-resort crash logger: records where the launcher died, then lets it end. */
+static LONG WINAPI launcher_crashfilter(EXCEPTION_POINTERS *ep)
+{
+    if (ep && ep->ExceptionRecord)
+        jlog("launcher: *** CRASH code=0x%08lx addr=%p ***",
+             (unsigned long)ep->ExceptionRecord->ExceptionCode,
+             ep->ExceptionRecord->ExceptionAddress);
+    else
+        jlog("launcher: *** CRASH (no info) ***");
+    return EXCEPTION_EXECUTE_HANDLER;
 }
 
 #ifdef _WIN64
@@ -438,7 +452,10 @@ int wmain(int argc, wchar_t **argv)
     }
     if (g_debug)
         wprintf(L"(debug on; log: %ls)\n", g_logpathW);
-    jlog("launcher: start (%d-bit)", SELF_IS_64 ? 64 : 32);
+    SetUnhandledExceptionFilter(launcher_crashfilter);
+    jlog("launcher: start BUILD=%s (%d-bit) argc=%d",
+         SADIEDATE_BUILD, SELF_IS_64 ? 64 : 32, argc);
+    { int i; for (i = 0; i < argc; ++i) jlog("launcher: argv[%d]=[%ls]", i, argv[i]); }
 
     if (argc == 2 && (!wcscmp(argv[1], L"/?") || !wcscmp(argv[1], L"-h") ||
                       !wcscmp(argv[1], L"--help"))) {
@@ -471,6 +488,8 @@ int wmain(int argc, wchar_t **argv)
                                  extraArgs, 1024, iniPath);
 
         nprog = gather_programs(iniPath, progs, MAX_PROGRAMS);
+        jlog("launcher: INI mode, nprog=%d selector=%ls", nprog,
+             selector ? selector : L"(none)");
         if (nprog == 0) {
             /* Fall back to the single Program= line. */
             GetPrivateProfileStringW(L"SadieDate", L"Program", L"",
@@ -478,6 +497,7 @@ int wmain(int argc, wchar_t **argv)
             wcsncpy(targetStr, globalDate, 127);
         } else {
             idx = choose_program(progs, nprog, selector);
+            jlog("launcher: menu choice idx=%d", idx);
             if (idx < 0) { wprintf(L"\nCancelled.\n"); return 0; }
             wcsncpy(program, progs[idx].path, MAX_PATH - 1);
             program[MAX_PATH - 1] = L'\0';

@@ -65,6 +65,22 @@ static void logline(const char *fmt, ...)
     }
 }
 static unsigned g_modCount = 0, g_slotCount = 0;   /* diagnostics */
+#define SADIEDATE_BUILD "2026-10-10e"
+
+/* Log the first few access violations anywhere in the process, with the faulting
+ * address, so we can tell whether a crash is inside this shim or in the host. */
+static LONG g_vehCount = 0;
+static LONG CALLBACK veh_logger(EXCEPTION_POINTERS *ep)
+{
+    if (ep && ep->ExceptionRecord &&
+        ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        if (InterlockedIncrement(&g_vehCount) <= 6)
+            logline("hook: ACCESS VIOLATION at %p (code 0x%08lx)",
+                    ep->ExceptionRecord->ExceptionAddress,
+                    (unsigned long)ep->ExceptionRecord->ExceptionCode);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;   /* never interfere with normal handling */
+}
 
 /* The constant offset, in 100-ns units, to SUBTRACT from every date read.
  * Positive => the process sees an earlier date. 0 => shim disabled. */
@@ -266,13 +282,16 @@ static void patch_module(BYTE *base)
 
     rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]
               .VirtualAddress;
-    if (!rva)
+    if (!rva || rva >= nt->OptionalHeader.SizeOfImage)
         return;
 
     imp = (IMAGE_IMPORT_DESCRIPTOR *)(base + rva);
-    for (; imp->Name; imp++) {
-        IMAGE_THUNK_DATA *thunk = (IMAGE_THUNK_DATA *)(base + imp->FirstThunk);
-        for (; thunk->u1.Function; thunk++) {
+    for (; !IsBadReadPtr(imp, sizeof(*imp)) && imp->Name; imp++) {
+        IMAGE_THUNK_DATA *thunk;
+        if (imp->FirstThunk == 0 || imp->FirstThunk >= nt->OptionalHeader.SizeOfImage)
+            continue;
+        thunk = (IMAGE_THUNK_DATA *)(base + imp->FirstThunk);
+        for (; !IsBadReadPtr(thunk, sizeof(*thunk)) && thunk->u1.Function; thunk++) {
             void **slot = (void **)&thunk->u1.Function;
             void  *rep  = lookup_stub(*slot);
             if (rep)
@@ -323,7 +342,10 @@ static BOOL init_shim(void)
 
     /* Diagnostic log path (optional). Read first so we can log everything. */
     GetEnvironmentVariableA("SADIEDATE_LOG", g_logpath, sizeof(g_logpath));
-    logline("hook: DllMain attach, pid=%lu", (unsigned long)GetCurrentProcessId());
+    logline("hook: DllMain attach, BUILD=%s pid=%lu",
+            SADIEDATE_BUILD, (unsigned long)GetCurrentProcessId());
+    if (g_logpath[0])
+        AddVectoredExceptionHandler(1, veh_logger);   /* only when logging */
 
     /* Read the offset the launcher passed us. Absent/zero => stay disabled. */
     n = GetEnvironmentVariableA("SADIEDATE_OFFSET", buf, sizeof(buf));
