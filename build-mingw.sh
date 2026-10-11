@@ -22,7 +22,9 @@ mkdir -p "$OUT" "$DIST"
 # Target Windows XP and up; resolve newer APIs at runtime via GetProcAddress.
 # -Wno-cast-function-type: GetProcAddress/CreateRemoteThread casts are the
 # documented Win32 idiom and are intentional here.
-CFLAGS_COMMON="-O2 -Wall -Wextra -Wno-cast-function-type \
+# -static: self-contained binaries with NO dependency on MinGW runtime DLLs
+# (e.g. libgcc_s_dw2-1.dll), which are not present on a plain Windows XP box.
+CFLAGS_COMMON="-O2 -Wall -Wextra -Wno-cast-function-type -static \
  -D_WIN32_WINNT=0x0501 -DWINVER=0x0501"
 
 echo "== Hook DLL (32-bit) =="
