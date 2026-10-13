@@ -66,7 +66,7 @@ static void logline(const char *fmt, ...)
     }
 }
 static unsigned g_modCount = 0, g_slotCount = 0;   /* diagnostics */
-#define SADIEDATE_BUILD "2026-10-11a"
+#define SADIEDATE_BUILD "2026-10-11b"
 
 /* Log the first few access violations anywhere in the process, with the faulting
  * address, so we can tell whether a crash is inside this shim or in the host. */
@@ -153,31 +153,61 @@ static void shift_systemtime(LPSYSTEMTIME st)
     }
 }
 
+/* ---- recursion guard ----------------------------------------------------- *
+ * A hooked function (e.g. GetLocalTime) may internally call another hooked
+ * function (e.g. NtQuerySystemTime). Without a guard the offset is applied at
+ * every layer -> the date is shifted back twice. This per-thread flag makes the
+ * OUTERMOST hooked call apply the offset exactly once; nested calls return the
+ * real (unshifted) value so the outer function computes correctly.            */
+static DWORD g_tls = TLS_OUT_OF_INDEXES;
+static int hook_enter(void)   /* returns 1 if this is the outermost hooked call */
+{
+    if (g_tls == TLS_OUT_OF_INDEXES) return 1;   /* no TLS: degrade gracefully */
+    if (TlsGetValue(g_tls)) return 0;            /* already inside -> nested    */
+    TlsSetValue(g_tls, (LPVOID)1);
+    return 1;
+}
+static void hook_leave(int outer)
+{
+    if (outer && g_tls != TLS_OUT_OF_INDEXES)
+        TlsSetValue(g_tls, (LPVOID)0);
+}
+
 /* ---- replacement functions (stubs) --------------------------------------- */
 static void WINAPI my_GetSystemTime(LPSYSTEMTIME st)
 {
+    int outer = hook_enter();
     real_GetSystemTime(st);
-    if (st) shift_systemtime(st);
+    if (outer && st) shift_systemtime(st);
+    hook_leave(outer);
 }
 static void WINAPI my_GetLocalTime(LPSYSTEMTIME st)
 {
+    int outer = hook_enter();
     real_GetLocalTime(st);
-    if (st) shift_systemtime(st);              /* offset is a tz-independent span */
+    if (outer && st) shift_systemtime(st);     /* offset is a tz-independent span */
+    hook_leave(outer);
 }
 static void WINAPI my_GetSystemTimeAsFileTime(LPFILETIME ft)
 {
+    int outer = hook_enter();
     real_GetSystemTimeAsFileTime(ft);
-    if (ft) shift_filetime(ft);
+    if (outer && ft) shift_filetime(ft);
+    hook_leave(outer);
 }
 static void WINAPI my_GetSystemTimePreciseAsFileTime(LPFILETIME ft)
 {
+    int outer = hook_enter();
     real_GetSystemTimePreciseAsFileTime(ft);
-    if (ft) shift_filetime(ft);
+    if (outer && ft) shift_filetime(ft);
+    hook_leave(outer);
 }
 static NTSTATUS NTAPI my_NtQuerySystemTime(PLARGE_INTEGER t)
 {
+    int outer = hook_enter();
     NTSTATUS s = real_NtQuerySystemTime(t);
-    if (s == 0 && t) t->QuadPart -= g_offset;
+    if (outer && s == 0 && t) t->QuadPart -= g_offset;
+    hook_leave(outer);
     return s;
 }
 
@@ -359,6 +389,8 @@ static BOOL init_shim(void)
         logline("hook: offset is 0 -> shim disabled");
         return FALSE;
     }
+
+    g_tls = TlsAlloc();   /* recursion guard; stubs degrade safely if this fails */
 
     /* Optional: which functions to hook. Absent => hook everything. */
     n = GetEnvironmentVariableA("SADIEDATE_HOOKS", buf, sizeof(buf));
