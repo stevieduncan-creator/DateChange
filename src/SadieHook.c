@@ -66,7 +66,7 @@ static void logline(const char *fmt, ...)
     }
 }
 static unsigned g_modCount = 0, g_slotCount = 0;   /* diagnostics */
-#define SADIEDATE_BUILD "2026-10-11b"
+#define SADIEDATE_BUILD "2026-10-11c"
 
 /* Log the first few access violations anywhere in the process, with the faulting
  * address, so we can tell whether a crash is inside this shim or in the host. */

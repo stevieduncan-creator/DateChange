@@ -46,7 +46,7 @@
 #include <stdarg.h>
 #include <wchar.h>
 
-#define SADIEDATE_BUILD "2026-10-11b"
+#define SADIEDATE_BUILD "2026-10-11c"
 
 /* ---- optional diagnostics (INI: [SadieDate] Debug=1) --------------------- */
 static int     g_debug = 0;
@@ -64,9 +64,14 @@ static void jlog(const char *fmt, ...)
     if (g_debug)
         wprintf(L"  [debug] %hs\n", buf);
     if (g_logpathW[0]) {
-        HANDLE f = CreateFileW(g_logpathW, GENERIC_WRITE,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        HANDLE f;
+        int tries;
+        for (tries = 0, f = INVALID_HANDLE_VALUE; tries < 5 && f == INVALID_HANDLE_VALUE; ++tries) {
+            f = CreateFileW(g_logpathW, GENERIC_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (f == INVALID_HANDLE_VALUE) Sleep(5);   /* retry transient lock (AV) */
+        }
         if (f != INVALID_HANDLE_VALUE) {
             DWORD wr;
             int m = _snprintf(line, sizeof(line) - 1, "%s\r\n", buf);
@@ -611,15 +616,21 @@ int wmain(int argc, wchar_t **argv)
     /* Debug self-test: can the DLL load in THIS (already-initialised) process?
      * If yes here but not in the target, the target failure is the suspended
      * loader, not the DLL itself. Left loaded; the launcher exits momentarily. */
-    if (g_debug) {
-        HMODULE selftest = LoadLibraryW(dllPath);
-        jlog("launcher: self-load test: %s (err=%lu)",
-             selftest ? "DLL loads OK in launcher" : "DLL FAILED to load in launcher",
-             selftest ? 0UL : (unsigned long)GetLastError());
-    }
-
     {
-        BOOL injected = inject(pi.hProcess, dllPath);   /* try while suspended */
+        DWORD selfErr = 0;
+        BOOL selfOk = TRUE, injected;
+        int tries = 0;
+
+        if (g_debug) {
+            HMODULE selftest = LoadLibraryW(dllPath);
+            selfOk = (selftest != NULL);
+            selfErr = selfOk ? 0 : GetLastError();
+            jlog("launcher: self-load test: %s (err=%lu)",
+                 selfOk ? "DLL loads OK in launcher" : "DLL FAILED to load in launcher",
+                 (unsigned long)selfErr);
+        }
+
+        injected = inject(pi.hProcess, dllPath);        /* try while suspended */
         if (injected) {
             jlog("launcher: inject OK (pre-resume)");
             ResumeThread(pi.hThread);
@@ -627,15 +638,14 @@ int wmain(int argc, wchar_t **argv)
             /* On Windows XP the loader isn't initialised while the process is
              * suspended, so LoadLibrary fails. Resume to initialise it, then
              * retry quickly (SADiE's date check comes after its hardware init). */
-            int t;
             jlog("launcher: pre-resume inject failed; resuming then retrying");
             ResumeThread(pi.hThread);
-            for (t = 0; t < 25 && !injected; ++t) {
+            for (tries = 0; tries < 25 && !injected; ++tries) {
                 injected = inject(pi.hProcess, dllPath);
                 if (!injected) Sleep(50);
             }
             jlog("launcher: post-resume inject %s after %d tr%s",
-                 injected ? "OK" : "FAILED", t, t == 1 ? "y" : "ies");
+                 injected ? "OK" : "FAILED", tries, tries == 1 ? "y" : "ies");
         }
 
         if (injected)
@@ -643,6 +653,28 @@ int wmain(int argc, wchar_t **argv)
         else
             wprintf(L"\n*** WARNING: Could not install the date shim. The program\n"
                     L"    started with the REAL date (it may hit its date check). ***\n");
+
+        /* In Debug mode, pop a dialog with the outcome so it's easy to screenshot
+         * even when the log file can't be written (e.g. locked by antivirus). */
+        if (g_debug) {
+            wchar_t msg[600];
+            _snwprintf(msg, 600,
+                L"SadieDate %hs\r\n\r\n"
+                L"Program:  %ls\r\n"
+                L"Will see: %04d-%02d-%02d\r\n\r\n"
+                L"Self-load test: %ls%ls\r\n"
+                L"Date shim: %ls%ls\r\n\r\n"
+                L"If the shim is INSTALLED, SADiE should see the past date.\r\n"
+                L"If it FAILED, tell Claude this result.",
+                SADIEDATE_BUILD, program,
+                stTarget.wYear, stTarget.wMonth, stTarget.wDay,
+                selfOk ? L"OK" : L"FAILED (err ", selfOk ? L"" : L")",
+                injected ? L"INSTALLED" : L"FAILED to install",
+                injected ? L"" : L" -- SADiE ran with the REAL date");
+            msg[599] = L'\0';
+            MessageBoxW(NULL, msg, L"SadieDate - debug result",
+                        MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+        }
     }
 
     jlog("launcher: launcher exiting normally");

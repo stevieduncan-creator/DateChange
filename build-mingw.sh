@@ -40,13 +40,13 @@ echo "== Launcher (32-bit) -> SadieDate.exe =="
 $RC32 -I "$SRC" "$SRC/SadieInject.rc" -O coff -o "$OUT/inject32.res.o"
 $CC32 -municode $CFLAGS_COMMON -s \
     -o "$OUT/SadieDate.exe" "$SRC/SadieInject.c" "$OUT/inject32.res.o" \
-    -lshell32
+    -lshell32 -luser32
 
 echo "== Launcher (64-bit) -> SadieDate64.exe =="
 $RC64 -I "$SRC" "$SRC/SadieInject.rc" -O coff -o "$OUT/inject64.res.o"
 $CC64 -municode $CFLAGS_COMMON -s \
     -o "$OUT/SadieDate64.exe" "$SRC/SadieInject.c" "$OUT/inject64.res.o" \
-    -lshell32
+    -lshell32 -luser32
 
 echo "== Test tool ShowDate (32- and 64-bit) =="
 $CC32 $CFLAGS_COMMON -s -o "$OUT/ShowDate.exe"   "$SRC/ShowDate.c"
