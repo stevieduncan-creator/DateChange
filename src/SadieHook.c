@@ -66,7 +66,7 @@ static void logline(const char *fmt, ...)
     }
 }
 static unsigned g_modCount = 0, g_slotCount = 0;   /* diagnostics */
-#define SADIEDATE_BUILD "2026-10-11c"
+#define SADIEDATE_BUILD "2026-10-11d"
 
 /* Log the first few access violations anywhere in the process, with the faulting
  * address, so we can tell whether a crash is inside this shim or in the host. */
@@ -105,6 +105,9 @@ static unsigned g_mask = HOOK_ALL;
  * plugins loaded later)? This is the most invasive part; SADIEDATE_DYN=0 turns
  * it off, leaving only the already-loaded modules' date imports patched. */
 static int g_dyn = 1;
+
+/* Patch only the main EXE's imports (the gentlest possible footprint)? */
+static int g_exeonly = 0;
 
 /* ---- real function pointers (the genuine implementations) ---------------- */
 typedef void (WINAPI *GetSystemTime_t)(LPSYSTEMTIME);
@@ -339,6 +342,15 @@ static void patch_all_modules(void)
     PPEB_LDR_DATA ldr;
     LIST_ENTRY *head, *it;
 
+    /* Least-invasive mode: patch ONLY the main executable's import table, and
+     * nothing else (no system DLLs, no plugins, no GetProcAddress/LoadLibrary).
+     * Safest for a fragile host; enough if its date check is a direct import. */
+    if (g_exeonly) {
+        HMODULE exe = GetModuleHandleW(NULL);
+        if (exe) { g_modCount++; patch_module((BYTE *)exe); }
+        return;
+    }
+
     /* NtCurrentTeb() reads a segment register (fs:[0x30] / gs:[0x60]). GCC's
      * -Warray-bounds misreads that as a deref of address 0; it is not. */
 #if defined(__GNUC__)
@@ -403,6 +415,12 @@ static BOOL init_shim(void)
     n = GetEnvironmentVariableA("SADIEDATE_DYN", buf, sizeof(buf));
     if (n > 0 && n < sizeof(buf))
         g_dyn = (strtoul(buf, NULL, 10) != 0);
+    /* Optional: patch only the main EXE (forces dynamic hooks off). */
+    n = GetEnvironmentVariableA("SADIEDATE_EXEONLY", buf, sizeof(buf));
+    if (n > 0 && n < sizeof(buf) && strtoul(buf, NULL, 10) != 0) {
+        g_exeonly = 1;
+        g_dyn = 0;
+    }
 
     k32 = GetModuleHandleW(L"kernel32.dll");
     if (!k32)
@@ -453,9 +471,9 @@ static BOOL init_shim(void)
         add_pair((void *)real_LoadLibraryExW,             (void *)my_LoadLibraryExW);
     }
 
-    logline("hook: offsetSec=%lu mask=0x%02x dyn=%d GetLocalTime=%p GetSystemTime=%p "
-            "GSTAFT=%p NtQuery=%p pairs=%d",
-            (unsigned long)(g_offset / 10000000), g_mask, g_dyn,
+    logline("hook: offsetSec=%lu mask=0x%02x dyn=%d exeonly=%d GetLocalTime=%p "
+            "GetSystemTime=%p GSTAFT=%p NtQuery=%p pairs=%d",
+            (unsigned long)(g_offset / 10000000), g_mask, g_dyn, g_exeonly,
             (void *)real_GetLocalTime, (void *)real_GetSystemTime,
             (void *)real_GetSystemTimeAsFileTime, (void *)real_NtQuerySystemTime,
             g_npairs);
