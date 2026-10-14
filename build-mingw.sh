@@ -29,12 +29,12 @@ CFLAGS_COMMON="-O2 -Wall -Wextra -Wno-cast-function-type -static \
 
 echo "== Hook DLL (32-bit) =="
 $CC32 $CFLAGS_COMMON -shared -s \
-    -o "$OUT/SadieHook32.dll" "$SRC/SadieHook.c" \
+    -o "$OUT/SadieHook32.dll" "$SRC/SadieHook.c" -luser32 \
     -Wl,--enable-stdcall-fixup
 
 echo "== Hook DLL (64-bit) =="
 $CC64 $CFLAGS_COMMON -shared -s \
-    -o "$OUT/SadieHook64.dll" "$SRC/SadieHook.c"
+    -o "$OUT/SadieHook64.dll" "$SRC/SadieHook.c" -luser32
 
 echo "== Launcher (32-bit) -> SadieDate.exe =="
 $RC32 -I "$SRC" "$SRC/SadieInject.rc" -O coff -o "$OUT/inject32.res.o"

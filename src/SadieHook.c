@@ -36,7 +36,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define SADIEDATE_BUILD "2026-10-14a"
+#define SADIEDATE_BUILD "2026-10-14b"
 
 /* ---- optional diagnostic log (path from env SADIEDATE_LOG) ---------------- */
 static char g_logpath[MAX_PATH] = {0};
@@ -63,17 +63,42 @@ static void logline(const char *fmt, ...)
     }
 }
 
-/* ---- crash logger (first few access violations, for diagnosis) ----------- */
+/* ---- crash reporter: on the first access violation, name the faulting
+ * address and the module it lives in, so we can tell whether a crash is in our
+ * shim or in the host program. Shown as a popup (log files are unreliable on the
+ * XP test box) and also written to the log if one is configured. -------------*/
 static LONG g_vehCount = 0;
+static void module_for_addr(void *addr, wchar_t *out, int cap)
+{
+    HMODULE h = NULL;
+    out[0] = L'\0';
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)addr, &h) && h)
+        GetModuleFileNameW(h, out, cap);
+    if (!out[0]) wcsncpy(out, L"(unknown module)", cap);
+}
 static LONG CALLBACK veh_logger(EXCEPTION_POINTERS *ep)
 {
     if (ep && ep->ExceptionRecord &&
         ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-        if (InterlockedIncrement(&g_vehCount) <= 6)
-            logline("hook: ACCESS VIOLATION at %p",
-                    ep->ExceptionRecord->ExceptionAddress);
+        void *addr = ep->ExceptionRecord->ExceptionAddress;
+        LONG count = InterlockedIncrement(&g_vehCount);
+        if (count <= 6)
+            logline("hook: ACCESS VIOLATION at %p", addr);
+        if (count == 1) {
+            wchar_t mod[MAX_PATH], msg[MAX_PATH + 200];
+            module_for_addr(addr, mod, MAX_PATH);
+            _snwprintf(msg, MAX_PATH + 200,
+                L"A crash occurred. Please screenshot this and send it to Claude.\r\n\r\n"
+                L"Fault address: %p\r\nIn module:\r\n%ls",
+                addr, mod);
+            msg[MAX_PATH + 199] = L'\0';
+            MessageBoxW(NULL, msg, L"SadieDate - crash location",
+                        MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST);
+        }
     }
-    return EXCEPTION_CONTINUE_SEARCH;
+    return EXCEPTION_CONTINUE_SEARCH;   /* let normal crash handling proceed */
 }
 
 /* Which date functions to hook (bitmask from SADIEDATE_HOOKS). */
@@ -177,8 +202,7 @@ static BOOL init_shim(void)
     GetEnvironmentVariableA("SADIEDATE_LOG", g_logpath, sizeof(g_logpath));
     logline("hook: DllMain attach, BUILD=%s pid=%lu (inline)",
             SADIEDATE_BUILD, (unsigned long)GetCurrentProcessId());
-    if (g_logpath[0])
-        AddVectoredExceptionHandler(1, veh_logger);
+    AddVectoredExceptionHandler(1, veh_logger);   /* report a crash's location */
 
     n = GetEnvironmentVariableA("SADIEDATE_OFFSET", buf, sizeof(buf));
     if (n == 0 || n >= sizeof(buf)) {
