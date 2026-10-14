@@ -1,36 +1,30 @@
 /*
- * SadieHook.dll  -  a surgical, date-ONLY time shim.
+ * SadieHook.dll  -  a surgical, date-ONLY time shim (inline-hook version).
  *
  * Injected into a target process (e.g. SADiE) by SadieDate.exe. It makes the
- * process -- and every plugin DLL loaded into it -- see a date shifted into the
- * past by a CONSTANT offset, while the real system clock is left completely
- * alone (so files the process writes still get the correct real date, and drive
- * mounts / network auth keep working).
+ * process -- and EVERY DLL/plugin loaded into it, now or later -- see a date
+ * shifted into the past by a CONSTANT offset, while the real system clock is
+ * left completely alone.
  *
- * WHY THIS DOES NOT ALTER AUDIO
- *   - It hooks ONLY calendar-date functions (SYSTEMTIME / FILETIME based).
- *     It NEVER touches GetTickCount, timeGetTime, QueryPerformanceCounter or
- *     any other monotonic / high-resolution timer. Those drive the audio
- *     engine's buffering and sample timing, and they are left bit-for-bit
- *     untouched.
- *   - The offset is a CONSTANT that still advances at real-time rate, so the
- *     interval between any two time reads is preserved exactly. Even code that
- *     happened to read a date function sees unchanged deltas.
- *   (By contrast, RunAsDate-style tools also offset GetTickCount -- a 32-bit
- *    millisecond counter -- which overflows when shifted by years, feeding the
- *    audio path garbage. That is the likely cause of the A/B mismatch.)
+ * HOW IT HOOKS
+ *   It installs a short JMP at the very start of each calendar-date function in
+ *   kernel32 / ntdll, redirecting every caller to our replacement. Because all
+ *   modules ultimately call those same functions, ONE patch per function covers
+ *   the whole process -- including plugins loaded dynamically after injection.
+ *   There is no import-table patching, and no GetProcAddress / LoadLibrary
+ *   hooking (those broad hooks destabilised SADiE).
  *
- * HOW IT HOOKS (no code patching)
- *   It swaps function POINTERS in each module's Import Address Table (IAT) --
- *   it never overwrites executable code, so it cannot corrupt instructions or
- *   crash from a bad disassembly. To catch calls that bypass the IAT it also
- *   hooks GetProcAddress (dynamic resolution) and LoadLibrary* (so plugins
- *   loaded later get their IATs patched too).
+ *   The replacements never call the original (so no trampoline / instruction
+ *   decoding is needed): they read the REAL time directly from the fixed,
+ *   unhooked kernel shared-data page (KUSER_SHARED_DATA) and subtract the
+ *   constant offset. They touch ONLY calendar-date functions -- never
+ *   GetTickCount / timeGetTime / QueryPerformanceCounter -- so audio timing is
+ *   untouched, and the offset is constant so every interval is preserved.
  *
  * FAIL-SAFE
- *   If the offset is missing/zero, or anything cannot be resolved, the DLL does
- *   nothing and the target runs exactly as normal. It is built to never take
- *   the host process down.
+ *   If the offset is missing/zero, or a function can't be resolved, it is simply
+ *   not hooked and the target runs normally. The code never calls the functions
+ *   it patches, so there is no recursion.
  */
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -40,6 +34,9 @@
 #include <winternl.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
+
+#define SADIEDATE_BUILD "2026-10-14a"
 
 /* ---- optional diagnostic log (path from env SADIEDATE_LOG) ---------------- */
 static char g_logpath[MAX_PATH] = {0};
@@ -65,315 +62,108 @@ static void logline(const char *fmt, ...)
         CloseHandle(f);
     }
 }
-static unsigned g_modCount = 0, g_slotCount = 0;   /* diagnostics */
-#define SADIEDATE_BUILD "2026-10-11d"
 
-/* Log the first few access violations anywhere in the process, with the faulting
- * address, so we can tell whether a crash is inside this shim or in the host. */
+/* ---- crash logger (first few access violations, for diagnosis) ----------- */
 static LONG g_vehCount = 0;
 static LONG CALLBACK veh_logger(EXCEPTION_POINTERS *ep)
 {
     if (ep && ep->ExceptionRecord &&
         ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
         if (InterlockedIncrement(&g_vehCount) <= 6)
-            logline("hook: ACCESS VIOLATION at %p (code 0x%08lx)",
-                    ep->ExceptionRecord->ExceptionAddress,
-                    (unsigned long)ep->ExceptionRecord->ExceptionCode);
+            logline("hook: ACCESS VIOLATION at %p",
+                    ep->ExceptionRecord->ExceptionAddress);
     }
-    return EXCEPTION_CONTINUE_SEARCH;   /* never interfere with normal handling */
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
-/* The constant offset, in 100-ns units, to SUBTRACT from every date read.
- * Positive => the process sees an earlier date. 0 => shim disabled. */
-static LONGLONG g_offset = 0;
-static HMODULE  g_self = NULL;
-static BYTE    *g_k32base = NULL;     /* never patch these two: our stubs call */
-static BYTE    *g_ntdllbase = NULL;   /* their real funcs; keep them un-offset */
-
-/* Which date functions to hook (bitmask from SADIEDATE_HOOKS). Lets us fool a
- * license/date check without touching functions a hardware driver's I/O path
- * may rely on (e.g. GetSystemTimeAsFileTime / NtQuerySystemTime). */
+/* Which date functions to hook (bitmask from SADIEDATE_HOOKS). */
 #define HOOK_LOCALTIME        0x01   /* GetLocalTime                      */
 #define HOOK_SYSTEMTIME       0x02   /* GetSystemTime                     */
 #define HOOK_SYSTEMTIME_FT    0x04   /* GetSystemTimeAsFileTime           */
 #define HOOK_SYSTEMTIME_PREC  0x08   /* GetSystemTimePreciseAsFileTime    */
 #define HOOK_NTQUERY          0x10   /* NtQuerySystemTime                 */
 #define HOOK_ALL              0x1F
-static unsigned g_mask = HOOK_ALL;
+static unsigned  g_mask = HOOK_ALL;
+static LONGLONG  g_offset = 0;        /* 100-ns units to subtract          */
+static unsigned  g_hookCount = 0;
 
-/* Hook GetProcAddress + LoadLibrary* too (covers dynamically-resolved calls and
- * plugins loaded later)? This is the most invasive part; SADIEDATE_DYN=0 turns
- * it off, leaving only the already-loaded modules' date imports patched. */
-static int g_dyn = 1;
-
-/* Patch only the main EXE's imports (the gentlest possible footprint)? */
-static int g_exeonly = 0;
-
-/* ---- real function pointers (the genuine implementations) ---------------- */
-typedef void (WINAPI *GetSystemTime_t)(LPSYSTEMTIME);
-typedef void (WINAPI *GetLocalTime_t)(LPSYSTEMTIME);
-typedef void (WINAPI *GetSystemTimeAsFileTime_t)(LPFILETIME);
-typedef void (WINAPI *GetSystemTimePreciseAsFileTime_t)(LPFILETIME);
-typedef NTSTATUS (NTAPI *NtQuerySystemTime_t)(PLARGE_INTEGER);
-typedef FARPROC  (WINAPI *GetProcAddress_t)(HMODULE, LPCSTR);
-typedef HMODULE  (WINAPI *LoadLibraryA_t)(LPCSTR);
-typedef HMODULE  (WINAPI *LoadLibraryW_t)(LPCWSTR);
-typedef HMODULE  (WINAPI *LoadLibraryExA_t)(LPCSTR, HANDLE, DWORD);
-typedef HMODULE  (WINAPI *LoadLibraryExW_t)(LPCWSTR, HANDLE, DWORD);
-
-static GetSystemTime_t                    real_GetSystemTime;
-static GetLocalTime_t                     real_GetLocalTime;
-static GetSystemTimeAsFileTime_t          real_GetSystemTimeAsFileTime;
-static GetSystemTimePreciseAsFileTime_t   real_GetSystemTimePreciseAsFileTime;
-static NtQuerySystemTime_t                real_NtQuerySystemTime;
-static GetProcAddress_t                   real_GetProcAddress;
-static LoadLibraryA_t                     real_LoadLibraryA;
-static LoadLibraryW_t                     real_LoadLibraryW;
-static LoadLibraryExA_t                   real_LoadLibraryExA;
-static LoadLibraryExW_t                   real_LoadLibraryExW;
-
-/* ---- offset helpers ------------------------------------------------------ */
-static ULONGLONG ft_to_ull(const FILETIME *ft)
+/* ---- read the REAL system time from the kernel shared-data page ----------- *
+ * KUSER_SHARED_DATA is mapped read-only at a fixed address (0x7FFE0000) in
+ * every process on x86 and x64, on every Windows from XP onward (and Wine).
+ * SystemTime (UTC, 100-ns units since 1601) is at offset 0x14, stored as
+ * {LowPart, High1Time, High2Time}; the loop guards against a torn read.      */
+static ULONGLONG read_real_utc_100ns(void)
 {
-    return ((ULONGLONG)ft->dwHighDateTime << 32) | (ULONGLONG)ft->dwLowDateTime;
+    volatile LONG *p = (volatile LONG *)(ULONG_PTR)(0x7FFE0000 + 0x14);
+    LONG high1, high2;
+    ULONG low;
+    do {
+        high1 = p[1];
+        low   = (ULONG)p[0];
+        high2 = p[2];
+    } while (high1 != high2);
+    return ((ULONGLONG)(ULONG)high1 << 32) | (ULONGLONG)low;
 }
-static void ull_to_ft(ULONGLONG v, FILETIME *ft)
+static ULONGLONG spoofed_utc_100ns(void)
 {
-    ft->dwLowDateTime  = (DWORD)(v & 0xFFFFFFFFULL);
-    ft->dwHighDateTime = (DWORD)(v >> 32);
-}
-static void shift_filetime(FILETIME *ft)
-{
-    ULONGLONG v = ft_to_ull(ft);
-    ull_to_ft((ULONGLONG)((LONGLONG)v - g_offset), ft);
-}
-static void shift_systemtime(LPSYSTEMTIME st)
-{
-    FILETIME ft;
-    if (SystemTimeToFileTime(st, &ft)) {       /* pure field conversion */
-        shift_filetime(&ft);
-        FileTimeToSystemTime(&ft, st);
-    }
+    return (ULONGLONG)((LONGLONG)read_real_utc_100ns() - g_offset);
 }
 
-/* ---- recursion guard ----------------------------------------------------- *
- * A hooked function (e.g. GetLocalTime) may internally call another hooked
- * function (e.g. NtQuerySystemTime). Without a guard the offset is applied at
- * every layer -> the date is shifted back twice. This per-thread flag makes the
- * OUTERMOST hooked call apply the offset exactly once; nested calls return the
- * real (unshifted) value so the outer function computes correctly.            */
-static DWORD g_tls = TLS_OUT_OF_INDEXES;
-static int hook_enter(void)   /* returns 1 if this is the outermost hooked call */
+/* ---- replacement functions (self-contained: no call to the original) ----- */
+static void WINAPI my_GetSystemTimeAsFileTime(LPFILETIME ft)
 {
-    if (g_tls == TLS_OUT_OF_INDEXES) return 1;   /* no TLS: degrade gracefully */
-    if (TlsGetValue(g_tls)) return 0;            /* already inside -> nested    */
-    TlsSetValue(g_tls, (LPVOID)1);
-    return 1;
+    ULONGLONG v = spoofed_utc_100ns();
+    if (ft) { ft->dwLowDateTime = (DWORD)v; ft->dwHighDateTime = (DWORD)(v >> 32); }
 }
-static void hook_leave(int outer)
-{
-    if (outer && g_tls != TLS_OUT_OF_INDEXES)
-        TlsSetValue(g_tls, (LPVOID)0);
-}
-
-/* ---- replacement functions (stubs) --------------------------------------- */
 static void WINAPI my_GetSystemTime(LPSYSTEMTIME st)
 {
-    int outer = hook_enter();
-    real_GetSystemTime(st);
-    if (outer && st) shift_systemtime(st);
-    hook_leave(outer);
+    ULONGLONG v = spoofed_utc_100ns();
+    FILETIME ft;
+    ft.dwLowDateTime = (DWORD)v; ft.dwHighDateTime = (DWORD)(v >> 32);
+    if (st) FileTimeToSystemTime(&ft, st);
 }
 static void WINAPI my_GetLocalTime(LPSYSTEMTIME st)
 {
-    int outer = hook_enter();
-    real_GetLocalTime(st);
-    if (outer && st) shift_systemtime(st);     /* offset is a tz-independent span */
-    hook_leave(outer);
-}
-static void WINAPI my_GetSystemTimeAsFileTime(LPFILETIME ft)
-{
-    int outer = hook_enter();
-    real_GetSystemTimeAsFileTime(ft);
-    if (outer && ft) shift_filetime(ft);
-    hook_leave(outer);
+    ULONGLONG v = spoofed_utc_100ns();
+    FILETIME utc, local;
+    utc.dwLowDateTime = (DWORD)v; utc.dwHighDateTime = (DWORD)(v >> 32);
+    if (st && FileTimeToLocalFileTime(&utc, &local))
+        FileTimeToSystemTime(&local, st);
 }
 static void WINAPI my_GetSystemTimePreciseAsFileTime(LPFILETIME ft)
 {
-    int outer = hook_enter();
-    real_GetSystemTimePreciseAsFileTime(ft);
-    if (outer && ft) shift_filetime(ft);
-    hook_leave(outer);
+    my_GetSystemTimeAsFileTime(ft);   /* system-time resolution is fine here */
 }
 static NTSTATUS NTAPI my_NtQuerySystemTime(PLARGE_INTEGER t)
 {
-    int outer = hook_enter();
-    NTSTATUS s = real_NtQuerySystemTime(t);
-    if (outer && s == 0 && t) t->QuadPart -= g_offset;
-    hook_leave(outer);
-    return s;
+    if (t) t->QuadPart = (LONGLONG)spoofed_utc_100ns();
+    return 0; /* STATUS_SUCCESS */
 }
 
-/* forward decls */
-static void patch_module(BYTE *base);
-
-static FARPROC WINAPI my_GetProcAddress(HMODULE mod, LPCSTR name)
-{
-    FARPROC r = real_GetProcAddress(mod, name);
-    /* Only intercept by-name lookups (ordinals have a zero HIWORD). */
-    if (name && ((ULONG_PTR)name >> 16) != 0) {
-        if ((g_mask & HOOK_SYSTEMTIME) && r == (FARPROC)real_GetSystemTime)
-            return (FARPROC)my_GetSystemTime;
-        if ((g_mask & HOOK_LOCALTIME) && r == (FARPROC)real_GetLocalTime)
-            return (FARPROC)my_GetLocalTime;
-        if ((g_mask & HOOK_SYSTEMTIME_FT) && r == (FARPROC)real_GetSystemTimeAsFileTime)
-            return (FARPROC)my_GetSystemTimeAsFileTime;
-        if ((g_mask & HOOK_SYSTEMTIME_PREC) && real_GetSystemTimePreciseAsFileTime &&
-            r == (FARPROC)real_GetSystemTimePreciseAsFileTime)
-            return (FARPROC)my_GetSystemTimePreciseAsFileTime;
-        if ((g_mask & HOOK_NTQUERY) && real_NtQuerySystemTime &&
-            r == (FARPROC)real_NtQuerySystemTime)
-            return (FARPROC)my_NtQuerySystemTime;
-    }
-    return r;
-}
-static HMODULE WINAPI my_LoadLibraryA(LPCSTR n)
-{
-    HMODULE h = real_LoadLibraryA(n);
-    if (h) patch_module((BYTE *)h);
-    return h;
-}
-static HMODULE WINAPI my_LoadLibraryW(LPCWSTR n)
-{
-    HMODULE h = real_LoadLibraryW(n);
-    if (h) patch_module((BYTE *)h);
-    return h;
-}
-static HMODULE WINAPI my_LoadLibraryExA(LPCSTR n, HANDLE f, DWORD fl)
-{
-    HMODULE h = real_LoadLibraryExA(n, f, fl);
-    if (h) patch_module((BYTE *)h);
-    return h;
-}
-static HMODULE WINAPI my_LoadLibraryExW(LPCWSTR n, HANDLE f, DWORD fl)
-{
-    HMODULE h = real_LoadLibraryExW(n, f, fl);
-    if (h) patch_module((BYTE *)h);
-    return h;
-}
-
-/* ---- the real->replacement table ----------------------------------------- */
-typedef struct { void *real; void *stub; } HookPair;
-static HookPair g_pairs[16];
-static int      g_npairs = 0;
-
-static void add_pair(void *real, void *stub)
-{
-    if (real && g_npairs < 16) {
-        g_pairs[g_npairs].real = real;
-        g_pairs[g_npairs].stub = stub;
-        g_npairs++;
-    }
-}
-static void *lookup_stub(void *cur)
-{
-    int i;
-    for (i = 0; i < g_npairs; i++)
-        if (g_pairs[i].real == cur)
-            return g_pairs[i].stub;
-    return NULL;
-}
-
-/* ---- IAT patcher --------------------------------------------------------- */
-static void patch_slot(void **slot, void *rep)
+/* ---- install a permanent JMP at the start of a function ------------------ */
+static int install_inline_hook(void *target, void *stub)
 {
     DWORD old;
-    if (VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old)) {
-        *slot = rep;
-        VirtualProtect(slot, sizeof(void *), old, &old);
-        g_slotCount++;
-    }
-}
-
-static void patch_module(BYTE *base)
-{
-    IMAGE_DOS_HEADER *dos;
-    IMAGE_NT_HEADERS *nt;
-    IMAGE_IMPORT_DESCRIPTOR *imp;
-    DWORD rva;
-
-    if (!base || base == (BYTE *)g_self)        /* never patch ourselves */
-        return;
-    if (base == g_k32base || base == g_ntdllbase)
-        return;   /* leave kernel32/ntdll internals calling the real funcs */
-
-    dos = (IMAGE_DOS_HEADER *)base;
-    if (IsBadReadPtr(dos, sizeof(*dos)) || dos->e_magic != IMAGE_DOS_SIGNATURE)
-        return;
-    nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
-    if (IsBadReadPtr(nt, sizeof(*nt)) || nt->Signature != IMAGE_NT_SIGNATURE)
-        return;
-
-    rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]
-              .VirtualAddress;
-    if (!rva || rva >= nt->OptionalHeader.SizeOfImage)
-        return;
-
-    imp = (IMAGE_IMPORT_DESCRIPTOR *)(base + rva);
-    for (; !IsBadReadPtr(imp, sizeof(*imp)) && imp->Name; imp++) {
-        IMAGE_THUNK_DATA *thunk;
-        if (imp->FirstThunk == 0 || imp->FirstThunk >= nt->OptionalHeader.SizeOfImage)
-            continue;
-        thunk = (IMAGE_THUNK_DATA *)(base + imp->FirstThunk);
-        for (; !IsBadReadPtr(thunk, sizeof(*thunk)) && thunk->u1.Function; thunk++) {
-            void **slot = (void **)&thunk->u1.Function;
-            void  *rep  = lookup_stub(*slot);
-            if (rep)
-                patch_slot(slot, rep);
-        }
-    }
-}
-
-/* Walk the loader's in-memory module list and patch every module. Reading the
- * PEB loader list is safe to do under the loader lock (no API re-entry). */
-static void patch_all_modules(void)
-{
-    PPEB peb;
-    PPEB_LDR_DATA ldr;
-    LIST_ENTRY *head, *it;
-
-    /* Least-invasive mode: patch ONLY the main executable's import table, and
-     * nothing else (no system DLLs, no plugins, no GetProcAddress/LoadLibrary).
-     * Safest for a fragile host; enough if its date check is a direct import. */
-    if (g_exeonly) {
-        HMODULE exe = GetModuleHandleW(NULL);
-        if (exe) { g_modCount++; patch_module((BYTE *)exe); }
-        return;
-    }
-
-    /* NtCurrentTeb() reads a segment register (fs:[0x30] / gs:[0x60]). GCC's
-     * -Warray-bounds misreads that as a deref of address 0; it is not. */
-#if defined(__GNUC__)
-#  pragma GCC diagnostic push
-#  pragma GCC diagnostic ignored "-Warray-bounds"
+#ifdef _WIN64
+    unsigned char patch[14];
+    SIZE_T n = 14;
+    patch[0] = 0xFF; patch[1] = 0x25;          /* JMP [RIP+0]                */
+    *(DWORD *)(patch + 2) = 0;
+    *(void **)(patch + 6) = stub;              /* 64-bit absolute target     */
+#else
+    unsigned char patch[5];
+    SIZE_T n = 5;
+    patch[0] = 0xE9;                            /* JMP rel32                  */
+    *(LONG *)(patch + 1) = (LONG)((char *)stub - ((char *)target + 5));
 #endif
-    peb = NtCurrentTeb()->ProcessEnvironmentBlock;
-#if defined(__GNUC__)
-#  pragma GCC diagnostic pop
-#endif
-
-    if (!peb || !peb->Ldr)
-        return;
-    ldr  = peb->Ldr;
-    head = &ldr->InMemoryOrderModuleList;
-    for (it = head->Flink; it && it != head; it = it->Flink) {
-        LDR_DATA_TABLE_ENTRY *e =
-            CONTAINING_RECORD(it, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
-        if (e->DllBase) {
-            g_modCount++;
-            patch_module((BYTE *)e->DllBase);
-        }
-    }
+    if (!target)
+        return 0;
+    if (!VirtualProtect(target, n, PAGE_EXECUTE_READWRITE, &old))
+        return 0;
+    memcpy(target, patch, n);
+    VirtualProtect(target, n, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), target, n);
+    return 1;
 }
 
 /* ---- init ---------------------------------------------------------------- */
@@ -382,15 +172,14 @@ static BOOL init_shim(void)
     HMODULE k32, ntdll;
     char buf[64];
     DWORD n;
+    FARPROC pGST, pGLT, pGSTAFT, pGSTPAFT, pNtQ;
 
-    /* Diagnostic log path (optional). Read first so we can log everything. */
     GetEnvironmentVariableA("SADIEDATE_LOG", g_logpath, sizeof(g_logpath));
-    logline("hook: DllMain attach, BUILD=%s pid=%lu",
+    logline("hook: DllMain attach, BUILD=%s pid=%lu (inline)",
             SADIEDATE_BUILD, (unsigned long)GetCurrentProcessId());
     if (g_logpath[0])
-        AddVectoredExceptionHandler(1, veh_logger);   /* only when logging */
+        AddVectoredExceptionHandler(1, veh_logger);
 
-    /* Read the offset the launcher passed us. Absent/zero => stay disabled. */
     n = GetEnvironmentVariableA("SADIEDATE_OFFSET", buf, sizeof(buf));
     if (n == 0 || n >= sizeof(buf)) {
         logline("hook: SADIEDATE_OFFSET not set -> shim disabled");
@@ -401,87 +190,42 @@ static BOOL init_shim(void)
         logline("hook: offset is 0 -> shim disabled");
         return FALSE;
     }
-
-    g_tls = TlsAlloc();   /* recursion guard; stubs degrade safely if this fails */
-
-    /* Optional: which functions to hook. Absent => hook everything. */
     n = GetEnvironmentVariableA("SADIEDATE_HOOKS", buf, sizeof(buf));
     if (n > 0 && n < sizeof(buf)) {
         unsigned m = (unsigned)strtoul(buf, NULL, 10);
-        if (m != 0)
-            g_mask = m & HOOK_ALL;
-    }
-    /* Optional: hook GetProcAddress/LoadLibrary too (default yes). */
-    n = GetEnvironmentVariableA("SADIEDATE_DYN", buf, sizeof(buf));
-    if (n > 0 && n < sizeof(buf))
-        g_dyn = (strtoul(buf, NULL, 10) != 0);
-    /* Optional: patch only the main EXE (forces dynamic hooks off). */
-    n = GetEnvironmentVariableA("SADIEDATE_EXEONLY", buf, sizeof(buf));
-    if (n > 0 && n < sizeof(buf) && strtoul(buf, NULL, 10) != 0) {
-        g_exeonly = 1;
-        g_dyn = 0;
+        if (m != 0) g_mask = m & HOOK_ALL;
     }
 
     k32 = GetModuleHandleW(L"kernel32.dll");
-    if (!k32)
-        return FALSE;
     ntdll = GetModuleHandleW(L"ntdll.dll");
-    g_k32base = (BYTE *)k32;
-    g_ntdllbase = (BYTE *)ntdll;
-
-    /* Use the genuine GetProcAddress to resolve the genuine targets. */
-    real_GetProcAddress = (GetProcAddress_t)GetProcAddress(k32, "GetProcAddress");
-    if (!real_GetProcAddress)
+    if (!k32) {
+        logline("hook: no kernel32?! -> shim disabled");
         return FALSE;
-
-    real_GetSystemTime = (GetSystemTime_t)
-        real_GetProcAddress(k32, "GetSystemTime");
-    real_GetLocalTime = (GetLocalTime_t)
-        real_GetProcAddress(k32, "GetLocalTime");
-    real_GetSystemTimeAsFileTime = (GetSystemTimeAsFileTime_t)
-        real_GetProcAddress(k32, "GetSystemTimeAsFileTime");
-    real_GetSystemTimePreciseAsFileTime = (GetSystemTimePreciseAsFileTime_t)
-        real_GetProcAddress(k32, "GetSystemTimePreciseAsFileTime"); /* Win8+ */
-    real_LoadLibraryA  = (LoadLibraryA_t)  real_GetProcAddress(k32, "LoadLibraryA");
-    real_LoadLibraryW  = (LoadLibraryW_t)  real_GetProcAddress(k32, "LoadLibraryW");
-    real_LoadLibraryExA = (LoadLibraryExA_t)real_GetProcAddress(k32, "LoadLibraryExA");
-    real_LoadLibraryExW = (LoadLibraryExW_t)real_GetProcAddress(k32, "LoadLibraryExW");
-    if (ntdll)
-        real_NtQuerySystemTime = (NtQuerySystemTime_t)
-            real_GetProcAddress(ntdll, "NtQuerySystemTime");
-
-    /* Build the real->stub table (NULLs are skipped by add_pair). Only the
-     * date functions enabled by the mask are hooked; GetProcAddress and
-     * LoadLibrary* are always hooked so the enabled ones stay fully covered. */
-    if (g_mask & HOOK_SYSTEMTIME)
-        add_pair((void *)real_GetSystemTime,                  (void *)my_GetSystemTime);
-    if (g_mask & HOOK_LOCALTIME)
-        add_pair((void *)real_GetLocalTime,                   (void *)my_GetLocalTime);
-    if (g_mask & HOOK_SYSTEMTIME_FT)
-        add_pair((void *)real_GetSystemTimeAsFileTime,        (void *)my_GetSystemTimeAsFileTime);
-    if (g_mask & HOOK_SYSTEMTIME_PREC)
-        add_pair((void *)real_GetSystemTimePreciseAsFileTime, (void *)my_GetSystemTimePreciseAsFileTime);
-    if (g_mask & HOOK_NTQUERY)
-        add_pair((void *)real_NtQuerySystemTime,              (void *)my_NtQuerySystemTime);
-    if (g_dyn) {
-        add_pair((void *)real_GetProcAddress,             (void *)my_GetProcAddress);
-        add_pair((void *)real_LoadLibraryA,               (void *)my_LoadLibraryA);
-        add_pair((void *)real_LoadLibraryW,               (void *)my_LoadLibraryW);
-        add_pair((void *)real_LoadLibraryExA,             (void *)my_LoadLibraryExA);
-        add_pair((void *)real_LoadLibraryExW,             (void *)my_LoadLibraryExW);
     }
 
-    logline("hook: offsetSec=%lu mask=0x%02x dyn=%d exeonly=%d GetLocalTime=%p "
-            "GetSystemTime=%p GSTAFT=%p NtQuery=%p pairs=%d",
-            (unsigned long)(g_offset / 10000000), g_mask, g_dyn, g_exeonly,
-            (void *)real_GetLocalTime, (void *)real_GetSystemTime,
-            (void *)real_GetSystemTimeAsFileTime, (void *)real_NtQuerySystemTime,
-            g_npairs);
+    /* GetProcAddress resolves forwarders (e.g. kernel32 -> kernelbase), so we
+     * patch the real implementation that every caller ends up at. */
+    pGLT     = GetProcAddress(k32, "GetLocalTime");
+    pGST     = GetProcAddress(k32, "GetSystemTime");
+    pGSTAFT  = GetProcAddress(k32, "GetSystemTimeAsFileTime");
+    pGSTPAFT = GetProcAddress(k32, "GetSystemTimePreciseAsFileTime"); /* Win8+ */
+    pNtQ     = ntdll ? GetProcAddress(ntdll, "NtQuerySystemTime") : NULL;
 
-    patch_all_modules();
+    if (g_mask & HOOK_LOCALTIME)
+        g_hookCount += install_inline_hook((void *)pGLT,     (void *)my_GetLocalTime);
+    if (g_mask & HOOK_SYSTEMTIME)
+        g_hookCount += install_inline_hook((void *)pGST,     (void *)my_GetSystemTime);
+    if (g_mask & HOOK_SYSTEMTIME_FT)
+        g_hookCount += install_inline_hook((void *)pGSTAFT,  (void *)my_GetSystemTimeAsFileTime);
+    if (g_mask & HOOK_SYSTEMTIME_PREC)
+        g_hookCount += install_inline_hook((void *)pGSTPAFT, (void *)my_GetSystemTimePreciseAsFileTime);
+    if (g_mask & HOOK_NTQUERY)
+        g_hookCount += install_inline_hook((void *)pNtQ,     (void *)my_NtQuerySystemTime);
 
-    logline("hook: patched %u IAT slot(s) across %u module(s) -> shim ACTIVE",
-            g_slotCount, g_modCount);
+    logline("hook: offsetSec=%lu mask=0x%02x GLT=%p GST=%p GSTAFT=%p NtQ=%p "
+            "-> inline-hooked %u function(s) ACTIVE",
+            (unsigned long)(g_offset / 10000000), g_mask,
+            (void *)pGLT, (void *)pGST, (void *)pGSTAFT, (void *)pNtQ, g_hookCount);
     return TRUE;
 }
 
@@ -489,7 +233,6 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
 {
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
-        g_self = (HMODULE)hinst;
         DisableThreadLibraryCalls(hinst);
         init_shim();          /* failure just means "run normally" */
     }
