@@ -36,7 +36,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define SADIEDATE_BUILD "2026-10-14b"
+#define SADIEDATE_BUILD "2026-10-14c"
 
 /* ---- optional diagnostic log (path from env SADIEDATE_LOG) ---------------- */
 static char g_logpath[MAX_PATH] = {0};
@@ -165,6 +165,282 @@ static NTSTATUS NTAPI my_NtQuerySystemTime(PLARGE_INTEGER t)
     return 0; /* STATUS_SUCCESS */
 }
 
+/* ========================================================================== *
+ *  FILE / REGISTRY TIMESTAMP SHIFTING (32-bit only)
+ *
+ *  SADiE cross-checks the timestamps of its saved license/settings against the
+ *  date it thinks it is. Those files carry the REAL date (the clock keeps
+ *  running), so with the shim they look "from the future" and SADiE faults.
+ *  We shift the timestamps SADiE READS back by the same offset, so it sees a
+ *  consistent past -- while the files on disk keep their real dates.
+ *
+ *  These functions must call the original to get the real timestamp, so each is
+ *  detoured with a small trampoline (copy the first whole instructions, append
+ *  a jump back) built with a minimal length decoder. Anything the decoder is
+ *  unsure about is simply not hooked (safe). x86 only; x64 skips this.
+ * ========================================================================== */
+#ifndef _WIN64
+
+static void shift_ft(FILETIME *ft)
+{
+    if (ft && (ft->dwLowDateTime || ft->dwHighDateTime)) {
+        ULONGLONG v = ((ULONGLONG)ft->dwHighDateTime << 32) | ft->dwLowDateTime;
+        v = (ULONGLONG)((LONGLONG)v - g_offset);
+        ft->dwLowDateTime = (DWORD)v; ft->dwHighDateTime = (DWORD)(v >> 32);
+    }
+}
+
+/* per-thread guard: some of these functions call each other internally, so only
+ * the OUTERMOST call shifts (otherwise a timestamp would be shifted twice). */
+static DWORD g_ftls = TLS_OUT_OF_INDEXES;
+static int ft_enter(void)
+{
+    if (g_ftls == TLS_OUT_OF_INDEXES) return 1;
+    if (TlsGetValue(g_ftls)) return 0;
+    TlsSetValue(g_ftls, (LPVOID)1);
+    return 1;
+}
+static void ft_leave(int outer)
+{
+    if (outer && g_ftls != TLS_OUT_OF_INDEXES) TlsSetValue(g_ftls, (LPVOID)0);
+}
+
+/* ---- minimal x86 length decoder (prologue instructions only) ------------- */
+static int modrm_len(const unsigned char *p, int imm)
+{
+    unsigned char m = p[0];
+    int mod = m >> 6, rm = m & 7, len = 1;
+    if (mod != 3) {
+        if (rm == 4) {                 /* SIB */
+            unsigned char sib = p[1]; len++;
+            if (mod == 0 && (sib & 7) == 5) len += 4;
+            else if (mod == 1) len += 1;
+            else if (mod == 2) len += 4;
+        } else {
+            if (mod == 0 && rm == 5) len += 4;
+            else if (mod == 1) len += 1;
+            else if (mod == 2) len += 4;
+        }
+    }
+    return len + imm;
+}
+static int insn_len(const unsigned char *p)
+{
+    int i = 0;
+    unsigned char op;
+    for (;;) {                         /* skip prefixes */
+        unsigned char b = p[i];
+        if (b==0x66||b==0x67||b==0xF0||b==0xF2||b==0xF3||
+            b==0x2E||b==0x36||b==0x3E||b==0x26||b==0x64||b==0x65) { i++; continue; }
+        break;
+    }
+    op = p[i++];
+    if ((op>=0x50 && op<=0x5F) || op==0x90 || op==0xC3 || op==0xC9) return i;
+    if (op>=0xB8 && op<=0xBF) return i + 4;        /* mov reg,imm32 */
+    if (op>=0xB0 && op<=0xB7) return i + 1;        /* mov reg8,imm8 */
+    if (op==0x6A) return i + 1;                    /* push imm8 */
+    if (op==0x68) return i + 4;                    /* push imm32 */
+    if (op==0xA1||op==0xA3) return i + 4;          /* mov eax,[moffs32] */
+    if (op==0x88||op==0x89||op==0x8A||op==0x8B||op==0x8D||
+        op==0x01||op==0x03||op==0x09||op==0x0B||op==0x21||op==0x23||
+        op==0x29||op==0x2B||op==0x31||op==0x33||op==0x39||op==0x3B||
+        op==0x84||op==0x85||op==0x87||op==0xFF||op==0x8F)
+        return i + modrm_len(p + i, 0);
+    if (op==0x80||op==0x83||op==0xC6) return i + modrm_len(p + i, 1);
+    if (op==0x81||op==0xC7)           return i + modrm_len(p + i, 4);
+    return 0;                          /* unknown / not relocatable -> abort */
+}
+
+/* ---- trampoline allocator + detour installer ----------------------------- */
+static unsigned char *g_tramp = NULL;
+static SIZE_T g_tramp_used = 0;
+static void *install_detour(void *target, void *stub)
+{
+    unsigned char *t = (unsigned char *)target, *tr;
+    int copied = 0, len;
+    DWORD old;
+    if (!t) return NULL;
+    while (copied < 5) {               /* copy whole instructions >= 5 bytes */
+        len = insn_len(t + copied);
+        if (len <= 0 || copied + len > 20) return NULL;
+        copied += len;
+    }
+    if (!g_tramp) {
+        g_tramp = (unsigned char *)VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE,
+                                                PAGE_EXECUTE_READWRITE);
+        g_tramp_used = 0;
+    }
+    if (!g_tramp || g_tramp_used + (SIZE_T)copied + 5 > 4096) return NULL;
+    tr = g_tramp + g_tramp_used;
+    g_tramp_used += (copied + 5 + 15) & ~15;
+
+    memcpy(tr, t, copied);             /* original prologue ... */
+    tr[copied] = 0xE9;                 /* ... then JMP back to target+copied   */
+    *(LONG *)(tr + copied + 1) = (LONG)((t + copied) - (tr + copied + 5));
+
+    if (!VirtualProtect(t, 5, PAGE_EXECUTE_READWRITE, &old)) return NULL;
+    t[0] = 0xE9;                        /* patch target: JMP stub               */
+    *(LONG *)(t + 1) = (LONG)((unsigned char *)stub - (t + 5));
+    VirtualProtect(t, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), t, 5);
+    return tr;                          /* call this to run the original        */
+}
+
+/* ---- originals (trampolines) and stubs ----------------------------------- */
+typedef BOOL (WINAPI *GetFileTime_t)(HANDLE, LPFILETIME, LPFILETIME, LPFILETIME);
+typedef BOOL (WINAPI *GetFileAttributesExW_t)(LPCWSTR, GET_FILEEX_INFO_LEVELS, LPVOID);
+typedef BOOL (WINAPI *GetFileAttributesExA_t)(LPCSTR, GET_FILEEX_INFO_LEVELS, LPVOID);
+typedef HANDLE (WINAPI *FindFirstFileW_t)(LPCWSTR, LPWIN32_FIND_DATAW);
+typedef HANDLE (WINAPI *FindFirstFileA_t)(LPCSTR, LPWIN32_FIND_DATAA);
+typedef BOOL (WINAPI *FindNextFileW_t)(HANDLE, LPWIN32_FIND_DATAW);
+typedef BOOL (WINAPI *FindNextFileA_t)(HANDLE, LPWIN32_FIND_DATAA);
+typedef BOOL (WINAPI *GetFileInformationByHandle_t)(HANDLE, LPBY_HANDLE_FILE_INFORMATION);
+typedef LONG (WINAPI *RegQueryInfoKeyW_t)(HKEY, LPWSTR, LPDWORD, LPDWORD, LPDWORD,
+    LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, PFILETIME);
+typedef LONG (WINAPI *RegQueryInfoKeyA_t)(HKEY, LPSTR, LPDWORD, LPDWORD, LPDWORD,
+    LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, LPDWORD, PFILETIME);
+
+static GetFileTime_t                  o_GetFileTime;
+static GetFileAttributesExW_t         o_GetFileAttributesExW;
+static GetFileAttributesExA_t         o_GetFileAttributesExA;
+static FindFirstFileW_t               o_FindFirstFileW;
+static FindFirstFileA_t               o_FindFirstFileA;
+static FindNextFileW_t                o_FindNextFileW;
+static FindNextFileA_t                o_FindNextFileA;
+static GetFileInformationByHandle_t   o_GetFileInformationByHandle;
+static RegQueryInfoKeyW_t             o_RegQueryInfoKeyW;
+static RegQueryInfoKeyA_t             o_RegQueryInfoKeyA;
+
+static BOOL WINAPI my_GetFileTime(HANDLE h, LPFILETIME c, LPFILETIME a, LPFILETIME w)
+{
+    int outer = ft_enter();
+    BOOL r = o_GetFileTime(h, c, a, w);
+    if (r && outer) { shift_ft(c); shift_ft(a); shift_ft(w); }
+    ft_leave(outer);
+    return r;
+}
+static BOOL WINAPI my_GetFileAttributesExW(LPCWSTR n, GET_FILEEX_INFO_LEVELS l, LPVOID p)
+{
+    int outer = ft_enter();
+    BOOL r = o_GetFileAttributesExW(n, l, p);
+    if (r && outer && p) {
+        WIN32_FILE_ATTRIBUTE_DATA *d = (WIN32_FILE_ATTRIBUTE_DATA *)p;
+        shift_ft(&d->ftCreationTime); shift_ft(&d->ftLastAccessTime); shift_ft(&d->ftLastWriteTime);
+    }
+    ft_leave(outer);
+    return r;
+}
+static BOOL WINAPI my_GetFileAttributesExA(LPCSTR n, GET_FILEEX_INFO_LEVELS l, LPVOID p)
+{
+    int outer = ft_enter();
+    BOOL r = o_GetFileAttributesExA(n, l, p);
+    if (r && outer && p) {
+        WIN32_FILE_ATTRIBUTE_DATA *d = (WIN32_FILE_ATTRIBUTE_DATA *)p;
+        shift_ft(&d->ftCreationTime); shift_ft(&d->ftLastAccessTime); shift_ft(&d->ftLastWriteTime);
+    }
+    ft_leave(outer);
+    return r;
+}
+static HANDLE WINAPI my_FindFirstFileW(LPCWSTR n, LPWIN32_FIND_DATAW d)
+{
+    int outer = ft_enter();
+    HANDLE r = o_FindFirstFileW(n, d);
+    if (r != INVALID_HANDLE_VALUE && outer && d) {
+        shift_ft(&d->ftCreationTime); shift_ft(&d->ftLastAccessTime); shift_ft(&d->ftLastWriteTime);
+    }
+    ft_leave(outer);
+    return r;
+}
+static HANDLE WINAPI my_FindFirstFileA(LPCSTR n, LPWIN32_FIND_DATAA d)
+{
+    int outer = ft_enter();
+    HANDLE r = o_FindFirstFileA(n, d);
+    if (r != INVALID_HANDLE_VALUE && outer && d) {
+        shift_ft(&d->ftCreationTime); shift_ft(&d->ftLastAccessTime); shift_ft(&d->ftLastWriteTime);
+    }
+    ft_leave(outer);
+    return r;
+}
+static BOOL WINAPI my_FindNextFileW(HANDLE h, LPWIN32_FIND_DATAW d)
+{
+    int outer = ft_enter();
+    BOOL r = o_FindNextFileW(h, d);
+    if (r && outer && d) {
+        shift_ft(&d->ftCreationTime); shift_ft(&d->ftLastAccessTime); shift_ft(&d->ftLastWriteTime);
+    }
+    ft_leave(outer);
+    return r;
+}
+static BOOL WINAPI my_FindNextFileA(HANDLE h, LPWIN32_FIND_DATAA d)
+{
+    int outer = ft_enter();
+    BOOL r = o_FindNextFileA(h, d);
+    if (r && outer && d) {
+        shift_ft(&d->ftCreationTime); shift_ft(&d->ftLastAccessTime); shift_ft(&d->ftLastWriteTime);
+    }
+    ft_leave(outer);
+    return r;
+}
+static BOOL WINAPI my_GetFileInformationByHandle(HANDLE h, LPBY_HANDLE_FILE_INFORMATION d)
+{
+    int outer = ft_enter();
+    BOOL r = o_GetFileInformationByHandle(h, d);
+    if (r && outer && d) {
+        shift_ft(&d->ftCreationTime); shift_ft(&d->ftLastAccessTime); shift_ft(&d->ftLastWriteTime);
+    }
+    ft_leave(outer);
+    return r;
+}
+static LONG WINAPI my_RegQueryInfoKeyW(HKEY k, LPWSTR cn, LPDWORD ccn, LPDWORD rv,
+    LPDWORD sk, LPDWORD mskl, LPDWORD mcl, LPDWORD vc, LPDWORD mvnl, LPDWORD mvdl,
+    LPDWORD sd, PFILETIME ft)
+{
+    int outer = ft_enter();
+    LONG r = o_RegQueryInfoKeyW(k, cn, ccn, rv, sk, mskl, mcl, vc, mvnl, mvdl, sd, ft);
+    if (r == ERROR_SUCCESS && outer) shift_ft(ft);
+    ft_leave(outer);
+    return r;
+}
+static LONG WINAPI my_RegQueryInfoKeyA(HKEY k, LPSTR cn, LPDWORD ccn, LPDWORD rv,
+    LPDWORD sk, LPDWORD mskl, LPDWORD mcl, LPDWORD vc, LPDWORD mvnl, LPDWORD mvdl,
+    LPDWORD sd, PFILETIME ft)
+{
+    int outer = ft_enter();
+    LONG r = o_RegQueryInfoKeyA(k, cn, ccn, rv, sk, mskl, mcl, vc, mvnl, mvdl, sd, ft);
+    if (r == ERROR_SUCCESS && outer) shift_ft(ft);
+    ft_leave(outer);
+    return r;
+}
+
+/* Detour one function; record its trampoline (as the "original"). */
+#define DETOUR(mod, name, var) do { \
+    FARPROC p = (mod) ? GetProcAddress((mod), #name) : NULL; \
+    void *tr = install_detour((void *)p, (void *)my_##name); \
+    if (tr) { (var) = tr; g_ftHooks++; } \
+} while (0)
+
+static unsigned g_ftHooks = 0;
+static void install_filetime_hooks(void)
+{
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    HMODULE adv = GetModuleHandleW(L"advapi32.dll");
+    if (!adv) adv = LoadLibraryW(L"advapi32.dll");
+    g_ftls = TlsAlloc();
+
+    DETOUR(k32, GetFileTime,                  o_GetFileTime);
+    DETOUR(k32, GetFileAttributesExW,         o_GetFileAttributesExW);
+    DETOUR(k32, GetFileAttributesExA,         o_GetFileAttributesExA);
+    DETOUR(k32, FindFirstFileW,               o_FindFirstFileW);
+    DETOUR(k32, FindFirstFileA,               o_FindFirstFileA);
+    DETOUR(k32, FindNextFileW,                o_FindNextFileW);
+    DETOUR(k32, FindNextFileA,                o_FindNextFileA);
+    DETOUR(k32, GetFileInformationByHandle,   o_GetFileInformationByHandle);
+    DETOUR(adv, RegQueryInfoKeyW,             o_RegQueryInfoKeyW);
+    DETOUR(adv, RegQueryInfoKeyA,             o_RegQueryInfoKeyA);
+    logline("hook: file/registry timestamp detours installed: %u", g_ftHooks);
+}
+#endif /* !_WIN64 */
+
 /* ---- install a permanent JMP at the start of a function ------------------ */
 static int install_inline_hook(void *target, void *stub)
 {
@@ -250,6 +526,17 @@ static BOOL init_shim(void)
             "-> inline-hooked %u function(s) ACTIVE",
             (unsigned long)(g_offset / 10000000), g_mask,
             (void *)pGLT, (void *)pGST, (void *)pGSTAFT, (void *)pNtQ, g_hookCount);
+
+#ifndef _WIN64
+    /* Also shift the file/registry timestamps the target reads, so its saved
+     * data looks consistent with the faked date (default on; ShiftFileTimes=0
+     * in the INI turns it off). */
+    n = GetEnvironmentVariableA("SADIEDATE_FILETIME", buf, sizeof(buf));
+    if (!(n > 0 && n < sizeof(buf) && strtoul(buf, NULL, 10) == 0))
+        install_filetime_hooks();
+    else
+        logline("hook: file/registry timestamp shifting disabled by config");
+#endif
     return TRUE;
 }
 

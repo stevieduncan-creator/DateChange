@@ -46,7 +46,7 @@
 #include <stdarg.h>
 #include <wchar.h>
 
-#define SADIEDATE_BUILD "2026-10-14b"
+#define SADIEDATE_BUILD "2026-10-14c"
 
 /* ---- optional diagnostics (INI: [SadieDate] Debug=1) --------------------- */
 static int     g_debug = 0;
@@ -437,19 +437,11 @@ int wmain(int argc, wchar_t **argv)
         _snwprintf(hbuf, 16, L"%u", map_hooklevel(hookLevel));
         SetEnvironmentVariableW(L"SADIEDATE_HOOKS", hbuf);
     }
-    /* Hook GetProcAddress/LoadLibrary too? (default yes; 0 = less invasive) */
+    /* Also shift the file/registry timestamps the program reads, so its saved
+     * data looks consistent with the faked date (default on). */
     {
-        int dyn = (int)GetPrivateProfileIntW(L"SadieDate", L"HookDynamic", 1, iniPath);
-        SetEnvironmentVariableW(L"SADIEDATE_DYN", dyn ? L"1" : L"0");
-    }
-    /* HookScope: "all" (default) patches every module; "exe" patches only the
-     * target program's own imports -- the gentlest footprint, for fragile apps. */
-    {
-        wchar_t scope[16];
-        GetPrivateProfileStringW(L"SadieDate", L"HookScope", L"all", scope, 16, iniPath);
-        trimw(scope); _wcslwr(scope);
-        SetEnvironmentVariableW(L"SADIEDATE_EXEONLY",
-                                wcscmp(scope, L"exe") == 0 ? L"1" : L"0");
+        int sft = (int)GetPrivateProfileIntW(L"SadieDate", L"ShiftFileTimes", 1, iniPath);
+        SetEnvironmentVariableW(L"SADIEDATE_FILETIME", sft ? L"1" : L"0");
     }
 
     /* Diagnostics. Debug=1 in the INI, or SADIEDATE_LOG already set, turns on a
