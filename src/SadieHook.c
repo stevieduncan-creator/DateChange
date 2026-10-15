@@ -36,7 +36,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define SADIEDATE_BUILD "2026-10-14c"
+#define SADIEDATE_BUILD "2026-10-15a"
 
 /* ---- optional diagnostic log (path from env SADIEDATE_LOG) ---------------- */
 static char g_logpath[MAX_PATH] = {0};

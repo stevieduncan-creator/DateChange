@@ -1,0 +1,73 @@
+============================================================
+ SadieDate test kit  -  build 2026-10-15a
+============================================================
+
+WHY A NEW KIT
+-------------
+The last screenshots showed an OLD copy running (build 2026-10-11d)
+and the wrong date (2008-01-01).  A date from before SADiE was even
+installed can make SADiE's own licence check crash all by itself.
+
+So two things were going wrong at once: an old program file, and a
+bad date.  This kit fixes both and is clearly stamped 2026-10-15a so
+we can always tell it apart from older copies.
+
+FIRST, CLEAN UP (important)
+---------------------------
+1. Delete ANY old SadieDate folders / SadieDate.exe / SadieHook*.dll
+   you have lying around, so you cannot accidentally run an old one.
+2. Put THIS whole folder somewhere simple, e.g.  C:\SadieDate
+3. Open  SadieDate.ini  and check ONE line near the top:
+
+       Program=C:\Program Files\SADiE\bin\Sadie5.exe
+
+   Make it the real, full path to YOUR Sadie5.exe.  (The date line
+   is already set to  TargetDate=2017-10-12 , the date you know works
+   when you set the clock back by hand.)  Save the file.
+
+   Everything else reads the path from that one line, so you only set
+   it once.
+
+THEN RUN THE TESTS (just double-click, in order)
+------------------------------------------------
+Test-1-check-date.bat
+     Proves the shim works on THIS PC, without touching SADiE.
+     Every date it prints should say 2017-10-12 (not 2026), and the
+     seconds should tick up normally.  Screenshot the window.
+     --> If Test 1 shows 2017, the engine works.  Go on to Test 2.
+
+Test-2-run-sadie.bat
+     The real thing: launches SADiE seeing 2017-10-12, with
+     everything switched on.  A small "debug result" popup appears
+     first (it shows the build number and the date SADiE will see --
+     please screenshot it).  Then SADiE starts.
+     --> If SADiE opens and runs: we are done -- tell Claude!
+     --> If SADiE crashes: screenshot the debug popup, any
+         "crash location" popup, and the Event Viewer entry, then
+         run Test 3.
+
+ONLY IF TEST 2 CRASHES:
+Test-3-inject-only.bat
+     Loads the shim but leaves the date as today.  This is the most
+     useful single test:
+       * SADiE crashes here too  -> the shim itself upsets SADiE.
+       * SADiE runs fine here     -> the past date is the trigger.
+     Tell Claude which one happened.
+
+Test-4-run-sadie-no-filetimes.bat
+     Like Test 2 but with the timestamp-shifting feature off.
+     Tell Claude if it behaves differently from Test 2.
+
+WHAT TO SEND BACK
+-----------------
+For whichever test you stop at, send Claude:
+  * the "SadieDate - debug result" popup (shows build 2026-10-15a +
+    the date SADiE will see -- this confirms you are on the new kit),
+  * whether SADiE ran or crashed,
+  * if it crashed: any "crash location" popup, and the Event Viewer
+    entry (Start -> Run -> eventvwr -> Application -> the Sadie5.exe
+    "Application Error").
+
+Your real system clock is NEVER changed by any of this, so your
+network / mapped drives are unaffected.
+============================================================

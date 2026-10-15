@@ -46,7 +46,7 @@
 #include <stdarg.h>
 #include <wchar.h>
 
-#define SADIEDATE_BUILD "2026-10-14c"
+#define SADIEDATE_BUILD "2026-10-15a"
 
 /* ---- optional diagnostics (INI: [SadieDate] Debug=1) --------------------- */
 static int     g_debug = 0;
@@ -411,7 +411,8 @@ int wmain(int argc, wchar_t **argv)
     wchar_t targetStr[128] = {0}, extraArgs[1024] = {0};
     wchar_t dllPath[MAX_PATH], cmdline[MAX_PATH + 1024], offBuf[64];
     const wchar_t *workdirPtr = NULL;
-    int y, mo, d, h, mi, sec;
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, sec = 0;
+    int injectOnly = 0;
     WORD machine;
     SYSTEMTIME realLocal, stTarget;
     FILETIME ftReal, ftTarget;
@@ -429,19 +430,27 @@ int wmain(int argc, wchar_t **argv)
     wprintf(L"---------------------------------------------\n");
 
     /* Which date functions the shim should hook. Set it once here so it is
-     * inherited by SADiE (and by the sibling launcher across a hand-off). */
+     * inherited by SADiE (and by the sibling launcher across a hand-off).
+     * A value already present in the environment (e.g. set by a test .bat)
+     * wins over the INI, so the test kit can vary it without editing the INI. */
     {
-        wchar_t hookLevel[32], hbuf[16];
-        GetPrivateProfileStringW(L"SadieDate", L"HookLevel", L"full",
-                                 hookLevel, 32, iniPath);
-        _snwprintf(hbuf, 16, L"%u", map_hooklevel(hookLevel));
-        SetEnvironmentVariableW(L"SADIEDATE_HOOKS", hbuf);
+        wchar_t cur[16], hookLevel[32], hbuf[16];
+        if (GetEnvironmentVariableW(L"SADIEDATE_HOOKS", cur, 16) == 0) {
+            GetPrivateProfileStringW(L"SadieDate", L"HookLevel", L"full",
+                                     hookLevel, 32, iniPath);
+            _snwprintf(hbuf, 16, L"%u", map_hooklevel(hookLevel));
+            SetEnvironmentVariableW(L"SADIEDATE_HOOKS", hbuf);
+        }
     }
     /* Also shift the file/registry timestamps the program reads, so its saved
-     * data looks consistent with the faked date (default on). */
+     * data looks consistent with the faked date (default on). Again, an
+     * environment value already set (test kit) takes precedence over the INI. */
     {
-        int sft = (int)GetPrivateProfileIntW(L"SadieDate", L"ShiftFileTimes", 1, iniPath);
-        SetEnvironmentVariableW(L"SADIEDATE_FILETIME", sft ? L"1" : L"0");
+        wchar_t cur[8];
+        if (GetEnvironmentVariableW(L"SADIEDATE_FILETIME", cur, 8) == 0) {
+            int sft = (int)GetPrivateProfileIntW(L"SadieDate", L"ShiftFileTimes", 1, iniPath);
+            SetEnvironmentVariableW(L"SADIEDATE_FILETIME", sft ? L"1" : L"0");
+        }
     }
 
     /* Diagnostics. Debug=1 in the INI, or SADIEDATE_LOG already set, turns on a
@@ -523,7 +532,18 @@ int wmain(int argc, wchar_t **argv)
         press_enter_to_exit();
         return 2;
     }
-    if (!parse_target(targetStr, &y, &mo, &d, &h, &mi, &sec)) {
+    /* "now" / "today": a diagnostic mode. Inject and hook as usual, but with an
+     * essentially-zero date change (1 second), so the program sees the REAL
+     * date. If the program runs in this mode but crashes with a past date, the
+     * trouble is the date VALUE, not the injection/hooking itself. */
+    {
+        wchar_t tlow[128];
+        wcsncpy(tlow, targetStr, 127); tlow[127] = L'\0';
+        trimw(tlow); _wcslwr(tlow);
+        if (!wcscmp(tlow, L"now") || !wcscmp(tlow, L"today"))
+            injectOnly = 1;
+    }
+    if (!injectOnly && !parse_target(targetStr, &y, &mo, &d, &h, &mi, &sec)) {
         wprintf(L"\nERROR: Bad TargetDate \"%ls\". Use YYYY-MM-DD or YYYY-MM-DD HH:MM:SS.\n",
                 targetStr);
         press_enter_to_exit();
@@ -558,24 +578,29 @@ int wmain(int argc, wchar_t **argv)
     /* Constant offset = real_now - target (a duration, in 100ns). */
     GetLocalTime(&realLocal);
     stTarget = realLocal;
-    stTarget.wYear = (WORD)y; stTarget.wMonth = (WORD)mo; stTarget.wDay = (WORD)d;
-    stTarget.wDayOfWeek = 0;
-    if (h >= 0) stTarget.wHour = (WORD)h;
-    if (mi >= 0) stTarget.wMinute = (WORD)mi;
-    if (sec >= 0) { stTarget.wSecond = (WORD)sec; stTarget.wMilliseconds = 0; }
+    if (injectOnly) {
+        /* Diagnostic: 1-second offset -> hooks install, date essentially real. */
+        offset = 10000000;
+    } else {
+        stTarget.wYear = (WORD)y; stTarget.wMonth = (WORD)mo; stTarget.wDay = (WORD)d;
+        stTarget.wDayOfWeek = 0;
+        if (h >= 0) stTarget.wHour = (WORD)h;
+        if (mi >= 0) stTarget.wMinute = (WORD)mi;
+        if (sec >= 0) { stTarget.wSecond = (WORD)sec; stTarget.wMilliseconds = 0; }
 
-    if (!SystemTimeToFileTime(&realLocal, &ftReal) ||
-        !SystemTimeToFileTime(&stTarget, &ftTarget)) {
-        wprintf(L"\nERROR: Could not compute the date offset.\n");
-        press_enter_to_exit();
-        return 5;
-    }
-    offset = (LONGLONG)(((ULONGLONG)ftReal.dwHighDateTime << 32 | ftReal.dwLowDateTime))
-           - (LONGLONG)(((ULONGLONG)ftTarget.dwHighDateTime << 32 | ftTarget.dwLowDateTime));
-    if (offset <= 0) {
-        wprintf(L"\nERROR: TargetDate must be BEFORE the real current date.\n");
-        press_enter_to_exit();
-        return 5;
+        if (!SystemTimeToFileTime(&realLocal, &ftReal) ||
+            !SystemTimeToFileTime(&stTarget, &ftTarget)) {
+            wprintf(L"\nERROR: Could not compute the date offset.\n");
+            press_enter_to_exit();
+            return 5;
+        }
+        offset = (LONGLONG)(((ULONGLONG)ftReal.dwHighDateTime << 32 | ftReal.dwLowDateTime))
+               - (LONGLONG)(((ULONGLONG)ftTarget.dwHighDateTime << 32 | ftTarget.dwLowDateTime));
+        if (offset <= 0) {
+            wprintf(L"\nERROR: TargetDate must be BEFORE the real current date.\n");
+            press_enter_to_exit();
+            return 5;
+        }
     }
 
     _snwprintf(offBuf, 64, L"%I64d", (__int64)offset);     /* %I64d: XP msvcrt-safe */
@@ -584,9 +609,12 @@ int wmain(int argc, wchar_t **argv)
     wprintf(L"\nReal date (unchanged):  %04d-%02d-%02d %02d:%02d\n",
             realLocal.wYear, realLocal.wMonth, realLocal.wDay,
             realLocal.wHour, realLocal.wMinute);
-    wprintf(L"Program will see:       %04d-%02d-%02d %02d:%02d\n",
-            stTarget.wYear, stTarget.wMonth, stTarget.wDay,
-            stTarget.wHour, stTarget.wMinute);
+    if (injectOnly)
+        wprintf(L"Program will see:       the REAL date (injection-only test)\n");
+    else
+        wprintf(L"Program will see:       %04d-%02d-%02d %02d:%02d\n",
+                stTarget.wYear, stTarget.wMonth, stTarget.wDay,
+                stTarget.wHour, stTarget.wMinute);
     wprintf(L"Launching:              %ls\n", program);
 
     if (workdir[0]) workdirPtr = workdir;
@@ -658,23 +686,40 @@ int wmain(int argc, wchar_t **argv)
         /* In Debug mode, pop a dialog with the outcome so it's easy to screenshot
          * even when the log file can't be written (e.g. locked by antivirus). */
         if (g_debug) {
-            wchar_t msg[600];
-            _snwprintf(msg, 600,
+            wchar_t msg[700], seeLine[96];
+            if (injectOnly)
+                wcscpy(seeLine, L"the REAL date (injection-only test)");
+            else
+                _snwprintf(seeLine, 96, L"%04d-%02d-%02d",
+                           stTarget.wYear, stTarget.wMonth, stTarget.wDay);
+            seeLine[95] = L'\0';
+            _snwprintf(msg, 700,
                 L"SadieDate %hs\r\n\r\n"
                 L"Program:  %ls\r\n"
-                L"Will see: %04d-%02d-%02d\r\n\r\n"
+                L"Will see: %ls\r\n\r\n"
                 L"Self-load test: %ls%ls\r\n"
                 L"Date shim: %ls%ls\r\n\r\n"
-                L"If the shim is INSTALLED, SADiE should see the past date.\r\n"
+                L"If the shim is INSTALLED, SADiE should see that date.\r\n"
                 L"If it FAILED, tell Claude this result.",
-                SADIEDATE_BUILD, program,
-                stTarget.wYear, stTarget.wMonth, stTarget.wDay,
+                SADIEDATE_BUILD, program, seeLine,
                 selfOk ? L"OK" : L"FAILED (err ", selfOk ? L"" : L")",
                 injected ? L"INSTALLED" : L"FAILED to install",
                 injected ? L"" : L" -- SADiE ran with the REAL date");
-            msg[599] = L'\0';
+            msg[699] = L'\0';
             MessageBoxW(NULL, msg, L"SadieDate - debug result",
                         MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+        }
+    }
+
+    /* Optional: wait for the launched program to exit before returning. Off by
+     * default (the launcher normally bows out at once so it never lingers behind
+     * SADiE). The test .bat files set SADIEDATE_WAIT=1 so ShowDate's output stays
+     * in one tidy, screenshot-friendly window. */
+    {
+        wchar_t w[8];
+        if (GetEnvironmentVariableW(L"SADIEDATE_WAIT", w, 8) > 0 && w[0] == L'1') {
+            jlog("launcher: SADIEDATE_WAIT=1, waiting for program to exit");
+            WaitForSingleObject(pi.hProcess, INFINITE);
         }
     }
 
