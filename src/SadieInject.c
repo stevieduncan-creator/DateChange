@@ -616,6 +616,7 @@ int wmain(int argc, wchar_t **argv)
                 stTarget.wYear, stTarget.wMonth, stTarget.wDay,
                 stTarget.wHour, stTarget.wMinute);
     wprintf(L"Launching:              %ls\n", program);
+    fflush(stdout);   /* flush now so our text never trails the child's output */
 
     if (workdir[0]) workdirPtr = workdir;
     else if (dir_of_path(program, workdir, MAX_PATH)) workdirPtr = workdir;
@@ -682,6 +683,7 @@ int wmain(int argc, wchar_t **argv)
         else
             wprintf(L"\n*** WARNING: Could not install the date shim. The program\n"
                     L"    started with the REAL date (it may hit its date check). ***\n");
+        fflush(stdout);
 
         /* In Debug mode, pop a dialog with the outcome so it's easy to screenshot
          * even when the log file can't be written (e.g. locked by antivirus). */
